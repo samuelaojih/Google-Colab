@@ -118,9 +118,30 @@ var LULC =
 // ============================================================================
 // 5. STUDY AREA
 // ============================================================================
+//
+// FIX: CATCHMENTS.geometry() materializes the full boundary coordinates of
+// all 20 catchments into one literal geometry object. STUDY_AREA is then
+// reused in dozens of places below (every .clip(STUDY_AREA), and every
+// reduceRegion({geometry: STUDY_AREA, ...}) inside percentileNormalize /
+// meanConstraint / meanRaster). If the source catchment polygons are
+// vertex-dense, that repeated embedding is what triggers:
+//
+//   Request payload size exceeds the limit: 10485760 bytes.
+//
+// simplify() collapses redundant vertices within a tolerance. A tolerance
+// equal to ANALYSIS_SCALE (100 m) is safe here: nothing downstream in this
+// script resolves finer than 100 m, so a <=100 m boundary simplification is
+// imperceptible to every raster computation that uses STUDY_AREA, while
+// drastically cutting vertex count (and therefore request payload size).
+//
+// ============================================================================
 
 var STUDY_AREA =
-  CATCHMENTS.geometry();
+  CATCHMENTS.geometry()
+    .simplify({
+      maxError:
+        ANALYSIS_SCALE
+    });
 
 
 // ============================================================================
