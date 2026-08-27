@@ -741,65 +741,50 @@ var INPUT_FIELDS_TO_CHECK =
   );
 
 
-var NULL_VALUE_DIAGNOSTICS =
-  ee.FeatureCollection(
-
-    INPUT_FIELDS_TO_CHECK.map(
-      function(field) {
-
-        var nonNullCount =
-          INTEGRATED
-            .filter(
-              ee.Filter.notNull(
-                [
-                  field
-                ]
-              )
-            )
-            .size();
-
-
-        var nullCount =
-          INTEGRATED.size()
-            .subtract(
-              nonNullCount
-            );
-
-
-        return ee.Feature(
-          null,
-          {
-
-            'Field':
-              field,
-
-            'Null_Catchments':
-              nullCount,
-
-            'Non_Null_Catchments':
-              nonNullCount
-
-          }
-
-        );
-
-      }
-    )
-
-  );
-
-
 print('============================================================');
 print('NULL VALUE DIAGNOSTICS (SUITABILITY + GAP INPUTS)');
 print('============================================================');
 
 print(
-  'Any field below with Null_Catchments > 0 means that field is missing ' +
-  'for one or more catchments in SUITABILITY_ASSET or GAP_ASSET. Re-export ' +
-  'the corresponding upstream asset if so. Opportunity is still computed ' +
-  '(nulls are treated as 0) but those catchments will read 0 for that ' +
-  'intervention.',
-  NULL_VALUE_DIAGNOSTICS
+  'Printed individually (not as one collapsed object) so the numbers are ' +
+  'visible without clicking to expand. Null_Count > 0 or Mean = 0 for a ' +
+  'field means it is missing/zero in SUITABILITY_ASSET or GAP_ASSET for ' +
+  'one or more catchments -- re-check/re-export that upstream asset.'
+);
+
+
+INPUT_FIELDS_TO_CHECK.forEach(
+  function(field) {
+
+    var nonNullCount =
+      INTEGRATED
+        .filter(
+          ee.Filter.notNull(
+            [
+              field
+            ]
+          )
+        )
+        .size();
+
+
+    var nullCount =
+      INTEGRATED.size()
+        .subtract(
+          nonNullCount
+        );
+
+
+    print(
+      field + ' -- Null_Count:',
+      nullCount,
+      ' Mean:',
+      INTEGRATED.aggregate_mean(
+        field
+      )
+    );
+
+  }
 );
 
 
