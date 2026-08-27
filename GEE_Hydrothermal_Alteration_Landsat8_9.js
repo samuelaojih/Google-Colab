@@ -4,8 +4,11 @@
  * Study area : projects/ee-samuelaojih/assets/study_area
  * Method     : Classic band-ratio technique (Sabins 1997; Segal 1983;
  *              Kaufmann 1988) adapted to Landsat 8/9 OLI band numbering,
- *              plus a Crosta-technique (selective PCA) alteration index
- *              and a simple threshold-based mineral-zonation map.
+ *              plus a Crosta-technique (selective PCA) alteration index,
+ *              a simple threshold-based mineral-zonation map, and
+ *              cross-sensor clay/hydroxyl validation against Sentinel-2
+ *              (same-epoch, higher-res) and ASTER SWIR indices
+ *              (Ninomiya 2003/2005 — mineral-species-resolving).
  *
  * Paste this whole script into code.earthengine.google.com and run.
  *
@@ -261,7 +264,148 @@ legendItems.forEach(function(item) {
 Map.add(legend);
 
 // ============================================================
-// 9. EXPORTS
+// 9. SENTINEL-2 CLAY/HYDROXYL VALIDATION RATIO
+//    Sentinel-2 B11 (1610 nm) / B12 (2190 nm) is the same physical
+//    SWIR1/SWIR2 logic as Landsat B6/B7, at 20 m instead of 30 m, and
+//    with a much larger, more recent, more cloud-free archive — useful
+//    as an independent, higher-resolution cross-check on the Landsat
+//    hydroxyl/clay ratio (does NOT separate clay species by itself).
+// ============================================================
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBit = 1 << 10;
+  var cirrusBit = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBit).eq(0).and(qa.bitwiseAnd(cirrusBit).eq(0));
+  return image.updateMask(mask).divide(10000).clip(aoi);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', maxCloud))
+  .map(maskS2clouds);
+
+print('Number of Sentinel-2 scenes used:', s2.size());
+var s2Image = s2.median().clip(aoi);
+
+// Sentinel-2 equivalents of the Landsat ratios (B4=Red, B2=Blue,
+// B11=SWIR1, B12=SWIR2 — same interpretation as the OLI ratios above)
+var s2IronOxide = s2Image.select('B4').divide(s2Image.select('B2'))
+  .rename('S2_Iron_Oxide_Ratio');
+var s2HydroxylClay = s2Image.select('B11').divide(s2Image.select('B12'))
+  .rename('S2_Hydroxyl_Clay_Ratio');
+
+Map.addLayer(s2HydroxylClay, ratioVis, 'Sentinel-2 Hydroxyl/Clay Ratio (B11/B12)', false);
+Map.addLayer(s2IronOxide, ratioVis, 'Sentinel-2 Iron Oxide Ratio (B4/B2)', false);
+
+// ============================================================
+// 10. ASTER SWIR CLAY-MINERAL INDICES (Ninomiya 2003, 2005)
+//     ASTER's six narrow SWIR bands (B04-B09, 2.145-2.430 microns)
+//     resolve individual OH-bearing clay/mica/sulfate species that
+//     Landsat's single broad SWIR2 band (B7) cannot separate — this is
+//     the actual mineral-species check on the Landsat/Sentinel-2 clay
+//     ratio, not just a resolution upgrade.
+//
+//     IMPORTANT CAVEAT: the ASTER SWIR subsystem has been degraded/
+//     saturated since ~April 2008. Only use SWIR bands from scenes
+//     BEFORE that date for quantitative mineral indices. This means
+//     ASTER here validates the *lithology/alteration footprint*
+//     (assumed static over geologic time), not the current land
+//     surface — pair it with the modern Sentinel-2 ratio above for
+//     a temporal cross-check.
+// ============================================================
+var asterStart = '2000-01-01';
+var asterEnd   = '2008-04-01'; // SWIR detector reliable window
+
+var aster = ee.ImageCollection('ASTER/AST_L1T')
+  .filterBounds(aoi)
+  .filterDate(asterStart, asterEnd)
+  .filter(ee.Filter.lt('CLOUDCOVER', maxCloud))
+  .select(['B04', 'B05', 'B06', 'B07', 'B08', 'B09']);
+
+var asterCount = aster.size();
+print('Number of ASTER (pre-2008 SWIR) scenes found:', asterCount);
+print('If 0: no valid pre-2008 ASTER SWIR scenes exist over this AOI — ' +
+  'widen asterStart/asterEnd cautiously and treat indices as qualitative only.');
+
+var asterImage = aster.median().clip(aoi);
+
+// Kaolinite Index: high -> kaolinite
+var kaoliniteIndex = asterImage.select('B04').divide(asterImage.select('B05'))
+  .multiply(asterImage.select('B08').divide(asterImage.select('B06')))
+  .rename('ASTER_Kaolinite_Index');
+
+// Alunite Index: high -> alunite
+var aluniteIndex = asterImage.select('B07').divide(asterImage.select('B05'))
+  .multiply(asterImage.select('B04').divide(asterImage.select('B08')))
+  .rename('ASTER_Alunite_Index');
+
+// AlOH / phyllosilicate index (muscovite-illite-sericite-kaolinite group,
+// after Ninomiya 2003): high -> generic clay/mica hydroxyl alteration,
+// this is the closest ASTER analogue to the Landsat/S2 hydroxyl ratio
+var asterOHIndex = asterImage.select('B05').add(asterImage.select('B07'))
+  .divide(asterImage.select('B06'))
+  .rename('ASTER_AlOH_Index');
+
+// Calcite/carbonate-chlorite-epidote index: high -> propylitic/carbonate
+var calciteIndex = asterImage.select('B06').add(asterImage.select('B09'))
+  .divide(asterImage.select('B07').add(asterImage.select('B08')))
+  .rename('ASTER_Calcite_Index');
+
+var asterVis = {min: 0.9, max: 1.3, palette: ['000004','3b0f70','8c2981','de4968','fe9f6d','fcfdbf']};
+Map.addLayer(asterOHIndex, asterVis, 'ASTER AlOH/Clay Index (B5+B7)/B6', false);
+Map.addLayer(kaoliniteIndex, asterVis, 'ASTER Kaolinite Index', false);
+Map.addLayer(aluniteIndex, asterVis, 'ASTER Alunite Index', false);
+Map.addLayer(calciteIndex, asterVis, 'ASTER Calcite/Carbonate Index', false);
+
+// ============================================================
+// 11. CROSS-SENSOR VALIDATION OF THE CLAY/HYDROXYL SIGNAL
+//     Correlates the Landsat 8/9 hydroxyl/clay ratio against the
+//     Sentinel-2 equivalent (same-epoch, higher-res check) and the
+//     ASTER AlOH clay index (mineral-species-resolving check) at
+//     random sample points. A strong positive correlation gives
+//     confidence the Landsat-derived argillic/phyllic zones are a real
+//     mineralogical signal rather than a Landsat artifact (vegetation,
+//     shadow, sensor noise).
+// ============================================================
+var validationStack = hydroxylClay.rename('Landsat_Hydroxyl_Clay')
+  .addBands(s2HydroxylClay.rename('S2_Hydroxyl_Clay'))
+  .addBands(asterOHIndex.rename('ASTER_AlOH'));
+
+var samplePts = validationStack.sample({
+  region: aoi, scale: 30, numPixels: 500, geometries: true, seed: 42
+});
+
+print('Cross-sensor clay/hydroxyl sample points (inspect for missing ASTER values):',
+  samplePts.limit(10));
+
+var corrLandsatS2 = samplePts.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['Landsat_Hydroxyl_Clay', 'S2_Hydroxyl_Clay']
+});
+print('Correlation: Landsat vs Sentinel-2 hydroxyl/clay ratio', corrLandsatS2);
+
+var corrLandsatAster = samplePts.filter(ee.Filter.notNull(['ASTER_AlOH'])).reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['Landsat_Hydroxyl_Clay', 'ASTER_AlOH']
+});
+print('Correlation: Landsat vs ASTER AlOH clay index (n depends on pre-2008 coverage)',
+  corrLandsatAster);
+
+print(ui.Chart.feature.byFeature(samplePts, 'Landsat_Hydroxyl_Clay', 'S2_Hydroxyl_Clay')
+  .setChartType('ScatterChart')
+  .setOptions({title: 'Landsat vs Sentinel-2 Hydroxyl/Clay Ratio',
+    hAxis: {title: 'Landsat B6/B7'}, vAxis: {title: 'Sentinel-2 B11/B12'},
+    pointSize: 2, trendlines: {0: {}}}));
+
+print(ui.Chart.feature.byFeature(samplePts, 'Landsat_Hydroxyl_Clay', 'ASTER_AlOH')
+  .setChartType('ScatterChart')
+  .setOptions({title: 'Landsat Hydroxyl/Clay Ratio vs ASTER AlOH Index',
+    hAxis: {title: 'Landsat B6/B7'}, vAxis: {title: 'ASTER (B5+B7)/B6'},
+    pointSize: 2, trendlines: {0: {}}}));
+
+// ============================================================
+// 12. EXPORTS
 // ============================================================
 Export.image.toDrive({
   image: ratioStack,
@@ -283,6 +427,24 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
+Export.image.toDrive({
+  image: asterOHIndex.addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex),
+  description: 'ASTER_Clay_Mineral_Indices',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'aster_clay_indices',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+Export.table.toDrive({
+  collection: samplePts,
+  description: 'Clay_Hydroxyl_CrossSensor_Validation_Points',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'clay_validation_points',
+  fileFormat: 'CSV'
+});
+
 /**
  * INTERPRETATION SUMMARY
  * ------------------------------------------------------------
@@ -299,6 +461,27 @@ Export.image.toDrive({
  * Zonation map combines Iron-oxide + Hydroxyl-clay + Ferrous anomalies
  * (each > mean + 1 stdDev over the AOI) into 5 classes. This is a first-pass
  * reconnaissance tool — always validate with field sampling, spectral
- * libraries (e.g. USGS splib07), or hyperspectral data (ASTER/Sentinel-2/
- * PRISMA/EMIT) before drawing exploration conclusions.
+ * libraries (e.g. USGS splib07), or hyperspectral data (PRISMA/EMIT)
+ * before drawing exploration conclusions.
+ *
+ * CLAY/HYDROXYL CROSS-SENSOR VALIDATION (sections 9-11)
+ * Sentinel-2 (B11/B12)          same physical ratio as Landsat B6/B7 at
+ *                                20 m — confirms the spatial pattern is
+ *                                not a Landsat sensor artifact.
+ * ASTER AlOH Index (B5+B7)/B6   generic phyllosilicate/OH indicator with
+ *                                much finer SWIR spectral resolution.
+ * ASTER Kaolinite Index         high -> kaolinite specifically.
+ * ASTER Alunite Index           high -> alunite specifically (advanced
+ *                                argillic / high-sulfidation indicator).
+ * ASTER Calcite Index           high -> calcite/chlorite/epidote
+ *                                (propylitic halo, outer alteration zone).
+ * A high positive correlation (Pearson r, printed in the console) between
+ * the Landsat ratio and both the Sentinel-2 and ASTER indices supports
+ * treating the Landsat argillic/phyllic zones as a genuine mineralogical
+ * signal. NOTE: ASTER SWIR is only reliable pre-April-2008 (detector
+ * degradation since), so the ASTER check reflects the lithology/
+ * alteration footprint, assumed static, not current land cover — a weak
+ * or negative ASTER correlation more often means sparse/no valid
+ * pre-2008 coverage over the AOI than a false Landsat signal; check the
+ * printed ASTER scene count first.
  */
