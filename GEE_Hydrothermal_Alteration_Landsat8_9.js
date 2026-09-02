@@ -326,7 +326,7 @@ Map.addLayer(s2IronOxide, ratioVis, 'Sentinel-2 Iron Oxide Ratio (B4/B2)', false
 var asterStart = '2000-01-01';
 var asterEnd   = '2008-04-01'; // SWIR detector reliable window
 
-var aster = ee.ImageCollection('ASTER/AST_L1T')
+var aster = ee.ImageCollection('ASTER/AST_L1T_003')
   .filterBounds(aoi)
   .filterDate(asterStart, asterEnd)
   .filter(ee.Filter.lt('CLOUDCOVER', maxCloud))
