@@ -1,14 +1,23 @@
 /**
- * HYDROTHERMAL ALTERATION MAPPING — Landsat 8/9 OLI (Collection 2, Level-2 SR)
+ * HYDROTHERMAL ALTERATION MAPPING FOR GOLD EXPLORATION
+ * Landsat 8/9 OLI (Collection 2, Level-2 SR)
  * ------------------------------------------------------------------------
  * Study area : projects/ee-samuelaojih/assets/study_area
+ * Target     : Gold (Au) — the ratio weighting, ASTER refinement, and
+ *              structural layer below are tuned as a reconnaissance
+ *              vectoring tool for structurally controlled epithermal/
+ *              orogenic-style Au mineralization. See section 12 for how
+ *              to re-weight for a specific deposit style.
  * Method     : Classic band-ratio technique (Sabins 1997; Segal 1983;
  *              Kaufmann 1988) adapted to Landsat 8/9 OLI band numbering,
- *              plus a Crosta-technique (selective PCA) alteration index,
- *              a simple threshold-based mineral-zonation map, and
- *              cross-sensor clay/hydroxyl validation against Sentinel-2
- *              (same-epoch, higher-res) and ASTER SWIR indices
- *              (Ninomiya 2003/2005 — mineral-species-resolving).
+ *              a Crosta-technique (selective PCA) alteration index,
+ *              a threshold-based mineral-zonation map, cross-sensor
+ *              clay/hydroxyl validation against Sentinel-2 (same-epoch,
+ *              higher-res) and ASTER SWIR indices (Ninomiya 2003/2005 —
+ *              mineral-species-resolving), a gold-specific weighted
+ *              alteration vector, a DEM-derived structural lineament
+ *              (fault/fracture) density layer, and a combined Gold
+ *              Target Priority map.
  *
  * Paste this whole script into code.earthengine.google.com and run.
  *
@@ -405,7 +414,144 @@ print(ui.Chart.feature.byFeature(samplePts, 'Landsat_Hydroxyl_Clay', 'ASTER_AlOH
     pointSize: 2, trendlines: {0: {}}}));
 
 // ============================================================
-// 12. EXPORTS
+// 12. GOLD-SPECIFIC ALTERATION VECTORING
+//     Different Au deposit styles favor different parts of the ratio
+//     suite above:
+//       - High-sulfidation epithermal Au: advanced argillic core
+//         (alunite-kaolinite-pyrophyllite) + iron-oxide/gossan center
+//         -> weight Iron Oxide + Hydroxyl/Clay + ASTER Alunite highest.
+//       - Low-sulfidation epithermal Au (adularia-sericite): illite-
+//         sericite argillic halo + silicification, weaker advanced
+//         argillic signal, strong structural control.
+//       - Orogenic/mesothermal Au: sericite-carbonate-pyrite in shear
+//         zones (often subtle on ratios alone) -> structural control
+//         (section 13) matters more than the mineralogy here.
+//       - Porphyry-related Au: classic potassic-phyllic-argillic-
+//         propylitic zoning around a gossan-capped leached zone.
+//     This index is a generic reconnaissance vectoring tool, not a
+//     deposit-model-specific classifier — re-weight it if you know
+//     which style is expected in your terrane.
+// ============================================================
+function normalize01(img, bandName, geom, scale) {
+  var mm = img.select(bandName).reduceRegion({
+    reducer: ee.Reducer.minMax(), geometry: geom, scale: scale, maxPixels: 1e9, bestEffort: true
+  });
+  var min = ee.Number(mm.get(bandName + '_min'));
+  var max = ee.Number(mm.get(bandName + '_max'));
+  return img.select(bandName).subtract(min).divide(max.subtract(min)).rename(bandName + '_norm');
+}
+
+var ironOxide_n     = normalize01(ironOxide, 'Iron_Oxide_Ratio', aoi, 30);
+var hydroxylClay_n  = normalize01(hydroxylClay, 'Hydroxyl_Clay_Ratio', aoi, 30);
+var ferrous_n       = normalize01(ferrousMinerals, 'Ferrous_Mineral_Ratio', aoi, 30);
+
+// Core vector (Landsat/Sentinel-2 only — always available):
+// strongest where iron-oxide AND hydroxyl/clay are co-elevated, i.e.
+// the "advanced argillic" overlap class (4) from the zonation map —
+// the classic epithermal Au footprint.
+var goldVectorCore = ironOxide_n.multiply(0.45)
+  .add(hydroxylClay_n.multiply(0.45))
+  .add(ferrous_n.multiply(0.10))
+  .rename('Gold_Vector_Core');
+
+Map.addLayer(goldVectorCore, {min: 0, max: 1, palette: ['1a1a2e','16213e','0f3460','e94560','ffbe0b']},
+  'Gold Vector - Core (Landsat/S2)', false);
+
+// ASTER refinement (only meaningful where pre-2008 SWIR coverage
+// exists — check the ASTER scene count printed in section 10 first).
+// Alunite is weighted highest since it's the most Au-diagnostic
+// mineral in this set (advanced argillic / high-sulfidation core).
+var kaolinite_n = normalize01(kaoliniteIndex, 'ASTER_Kaolinite_Index', aoi, 30);
+var alunite_n   = normalize01(aluniteIndex, 'ASTER_Alunite_Index', aoi, 30);
+var asterOH_n   = normalize01(asterOHIndex, 'ASTER_AlOH_Index', aoi, 30);
+
+var goldVectorASTER = alunite_n.multiply(0.5)
+  .add(kaolinite_n.multiply(0.3))
+  .add(asterOH_n.multiply(0.2))
+  .rename('Gold_Vector_ASTER_Refinement');
+
+Map.addLayer(goldVectorASTER, {min: 0, max: 1, palette: ['1a1a2e','16213e','0f3460','e94560','ffbe0b']},
+  'Gold Vector - ASTER Refinement (pre-2008 only)', false);
+
+// ============================================================
+// 13. STRUCTURAL LINEAMENT ANALYSIS (fault/fracture proxy)
+//     Gold deposits of every style above are structurally controlled
+//     (faults/fractures as fluid pathways), so alteration alone is an
+//     incomplete target — this derives a lineament density surface
+//     from SRTM topography via Canny edge detection on a hillshade,
+//     as a proxy for the fault/fracture network.
+// ============================================================
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(aoi.buffer(2000));
+var hillshade = ee.Terrain.hillshade(srtm, 315, 45);
+
+var edges = ee.Algorithms.CannyEdgeDetector({image: hillshade, threshold: 10, sigma: 1});
+var lineaments = edges.updateMask(edges).clip(aoi);
+Map.addLayer(lineaments, {palette: ['ffffff']}, 'Structural Lineaments (Canny edges on hillshade)', false);
+
+// Lineament density: sum of edge pixels in a 500 m-radius disk kernel
+// -> higher density = more fractured/faulted ground = better fluid
+// pathways for structurally controlled Au mineralization.
+var kernel = ee.Kernel.circle({radius: 500, units: 'meters'});
+var lineamentDensity = edges.unmask(0).reduceNeighborhood({
+  reducer: ee.Reducer.sum(), kernel: kernel
+}).rename('Lineament_Density').clip(aoi);
+
+var lineamentDensity_n = normalize01(lineamentDensity, 'Lineament_Density', aoi, 30);
+Map.addLayer(lineamentDensity_n, {min: 0, max: 1, palette: ['ffffff','fee08b','d73027']},
+  'Lineament Density (structural control proxy)', false);
+
+// ============================================================
+// 14. COMBINED GOLD TARGET PRIORITY MAP
+//     Weighted sum of the alteration vector and structural density.
+//     Default weights (70% alteration / 30% structure) suit
+//     epithermal-style targeting; raise the structural weight (e.g.
+//     0.5/0.5) for orogenic/shear-zone-hosted settings where
+//     mineralogy alone is a weak vector.
+// ============================================================
+var altWeight = 0.7;
+var structWeight = 0.3;
+
+var goldTargetPriority = goldVectorCore.multiply(altWeight)
+  .add(lineamentDensity_n.multiply(structWeight))
+  .rename('Gold_Target_Priority');
+
+var priorityStats = goldTargetPriority.reduceRegion({
+  reducer: ee.Reducer.percentile([50, 75, 90]),
+  geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
+});
+var p50 = ee.Number(priorityStats.get('Gold_Target_Priority_p50'));
+var p75 = ee.Number(priorityStats.get('Gold_Target_Priority_p75'));
+var p90 = ee.Number(priorityStats.get('Gold_Target_Priority_p90'));
+
+// 0 = Low, 1 = Moderate, 2 = High, 3 = Very High priority
+var goldPriorityClass = ee.Image(0)
+  .where(goldTargetPriority.gt(p50), 1)
+  .where(goldTargetPriority.gt(p75), 2)
+  .where(goldTargetPriority.gt(p90), 3)
+  .rename('Gold_Priority_Class')
+  .updateMask(ee.Image(1));
+
+var priorityPalette = ['f7fbff', 'c6dbef', 'fd8d3c', 'de2d26'];
+Map.addLayer(goldPriorityClass, {min: 0, max: 3, palette: priorityPalette},
+  'GOLD TARGET PRIORITY MAP');
+
+var goldLegend = ui.Panel({style: {position: 'bottom-right', padding: '8px 15px'}});
+goldLegend.add(ui.Label('Gold Target Priority', {fontWeight: 'bold', fontSize: '14px'}));
+var goldLegendItems = [
+  ['f7fbff', 'Low (< median)'],
+  ['c6dbef', 'Moderate (median-75th pct)'],
+  ['fd8d3c', 'High (75th-90th pct)'],
+  ['de2d26', 'Very High (> 90th pct)']
+];
+goldLegendItems.forEach(function(item) {
+  var colorBox = ui.Label('', {backgroundColor: item[0], padding: '8px', margin: '0 6px 4px 0'});
+  var desc = ui.Label(item[1], {margin: '0 0 4px 0', fontSize: '11px'});
+  goldLegend.add(ui.Panel([colorBox, desc], ui.Panel.Layout.Flow('horizontal')));
+});
+Map.add(goldLegend);
+
+// ============================================================
+// 15. EXPORTS
 // ============================================================
 Export.image.toDrive({
   image: ratioStack,
@@ -443,6 +589,16 @@ Export.table.toDrive({
   folder: 'GEE_exports',
   fileNamePrefix: 'clay_validation_points',
   fileFormat: 'CSV'
+});
+
+Export.image.toDrive({
+  image: goldTargetPriority.addBands(goldPriorityClass).addBands(lineamentDensity_n),
+  description: 'Gold_Target_Priority_Map',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'gold_target_priority',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
 });
 
 /**
@@ -484,4 +640,37 @@ Export.table.toDrive({
  * or negative ASTER correlation more often means sparse/no valid
  * pre-2008 coverage over the AOI than a false Landsat signal; check the
  * printed ASTER scene count first.
+ *
+ * GOLD TARGETING LAYERS (sections 12-14)
+ * Gold Vector - Core             weighted 0.45 Iron Oxide + 0.45 Hydroxyl/
+ *                                 Clay + 0.10 Ferrous, i.e. brightest where
+ *                                 the advanced-argillic overlap (iron oxide
+ *                                 AND clay both anomalous) occurs — the
+ *                                 classic epithermal Au alteration core.
+ * Gold Vector - ASTER Refinement weighted 0.5 Alunite + 0.3 Kaolinite +
+ *                                 0.2 AlOH; alunite is the strongest single
+ *                                 Au-diagnostic mineral here (advanced
+ *                                 argillic/high-sulfidation indicator) —
+ *                                 only trust this where section 10 printed
+ *                                 a non-zero pre-2008 ASTER scene count.
+ * Lineament Density               Canny-edge density on an SRTM hillshade,
+ *                                 a proxy for the fault/fracture network
+ *                                 that channeled Au-bearing fluids — every
+ *                                 Au deposit style in this list is
+ *                                 structurally controlled, so alteration
+ *                                 without structure is a weaker target.
+ * Gold Target Priority Map        0.7 * Gold_Vector_Core + 0.3 * Lineament
+ *                                 Density, classed by percentile (median/
+ *                                 75th/90th) into Low/Moderate/High/Very
+ *                                 High. Raise the structural weight for
+ *                                 orogenic/shear-hosted settings; swap in
+ *                                 Gold_Vector_ASTER_Refinement in place of
+ *                                 (or blended with) the core vector where
+ *                                 pre-2008 ASTER coverage is good, since it
+ *                                 resolves alunite specifically. This is a
+ *                                 reconnaissance ranking, not a drill-target
+ *                                 selector — ground-truth Very High cells
+ *                                 with mapping, soil/rock geochemistry, or
+ *                                 hyperspectral data before committing
+ *                                 exploration budget.
  */
