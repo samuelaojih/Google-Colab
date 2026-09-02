@@ -104,14 +104,14 @@ Map.addLayer(image, {bands: ['SR_B6', 'SR_B5', 'SR_B4'], min: 0, max: 0.4},
 // sulfide caps, argillic-to-advanced-argillic zones near surface).
 // High values (bright) = iron-oxide-rich (weathered/oxidized) zones.
 var ironOxide = image.select('SR_B4').divide(image.select('SR_B2'))
-  .rename('Iron_Oxide_Ratio');
+  .rename('Iron_Oxide_Ratio').clip(aoi);
 
 // --- 5.2 Ferrous Mineral ratio: SWIR1 / NIR = B6/B5 ---
 // Highlights: biotite, chlorite, amphibole, pyroxene (mafic/propylitic
 // alteration — chlorite-epidote-carbonate assemblages).
 // High values = ferrous-silicate-bearing rocks.
 var ferrousMinerals = image.select('SR_B6').divide(image.select('SR_B5'))
-  .rename('Ferrous_Mineral_Ratio');
+  .rename('Ferrous_Mineral_Ratio').clip(aoi);
 
 // --- 5.3 Hydroxyl / Clay-Sericite-Alunite ratio: SWIR1 / SWIR2 = B6/B7 ---
 // Highlights: kaolinite, illite, muscovite/sericite, alunite, gypsum
@@ -119,7 +119,7 @@ var ferrousMinerals = image.select('SR_B6').divide(image.select('SR_B5'))
 // halo around ore bodies, since these OH-bearing minerals absorb
 // strongly in SWIR2 relative to SWIR1).
 var hydroxylClay = image.select('SR_B6').divide(image.select('SR_B7'))
-  .rename('Hydroxyl_Clay_Ratio');
+  .rename('Hydroxyl_Clay_Ratio').clip(aoi);
 
 // --- 5.4 Gossan ratio: NIR / Red = B5/B4 ---
 // Highlights: gossan (iron-capped outcrops above sulfide deposits) —
@@ -127,16 +127,17 @@ var hydroxylClay = image.select('SR_B6').divide(image.select('SR_B7'))
 // relative to iron oxide alone; used to separate true gossan from
 // generic ferruginous soils.
 var gossan = image.select('SR_B5').divide(image.select('SR_B4'))
-  .rename('Gossan_Ratio');
+  .rename('Gossan_Ratio').clip(aoi);
 
 // --- 5.5 Laterite / ferric-oxide + clay combined ratio: SWIR1/Blue = B6/B2 ---
 // Highlights: laterite/duricrust and deeply weathered regolith,
 // useful for distinguishing surficial weathering from bedrock alteration.
 var laterite = image.select('SR_B6').divide(image.select('SR_B2'))
-  .rename('Laterite_Ratio');
+  .rename('Laterite_Ratio').clip(aoi);
 
 var ratioStack = ironOxide.addBands(ferrousMinerals)
-  .addBands(hydroxylClay).addBands(gossan).addBands(laterite);
+  .addBands(hydroxylClay).addBands(gossan).addBands(laterite)
+  .clip(aoi);
 
 var ratioVis = {min: 0.8, max: 1.6, palette: ['000004','3b0f70','8c2981','de4968','fe9f6d','fcfdbf']};
 Map.addLayer(ironOxide, ratioVis, 'Iron Oxide Ratio (B4/B2)');
@@ -152,7 +153,7 @@ Map.addLayer(laterite, ratioVis, 'Laterite Ratio (B6/B2)', false);
 //       greenish/yellow = clay/sericite (argillic) zones
 //       bluish = propylitic/mafic zones
 // ============================================================
-var alterationComposite = ee.Image.cat([ironOxide, hydroxylClay, ferrousMinerals]);
+var alterationComposite = ee.Image.cat([ironOxide, hydroxylClay, ferrousMinerals]).clip(aoi);
 Map.addLayer(alterationComposite, {min: 0.8, max: 1.6}, 'Alteration Ratio Composite (R-G-B)');
 
 // ============================================================
@@ -189,7 +190,8 @@ function runPCA(img, bandNames) {
 
   var principalComponents = ee.Image(eigenVectors)
     .matrixMultiply(arrayImage2D)
-    .arrayProject([0]).arrayFlatten([bandNames.map(function(b, i) { return 'PC' + (i + 1); })]);
+    .arrayProject([0]).arrayFlatten([bandNames.map(function(b, i) { return 'PC' + (i + 1); })])
+    .clip(aoi);
 
   return {pcImage: principalComponents, eigenVectors: eigenVectors};
 }
@@ -247,7 +249,7 @@ var mineralZones = ee.Image(0)
   .where(propyliticAnomaly.and(feOxideAnomaly.not()).and(clayAnomaly.not()), 3)
   .where(feOxideAnomaly.and(clayAnomaly), 4)
   .rename('Alteration_Zone')
-  .updateMask(ee.Image(1)); // keep full extent, 0 = background
+  .clip(aoi); // keep full extent WITHIN the study area only, 0 = background
 
 var zonePalette = ['d9d9d9', 'e31a1c', 'ffd700', '1a9850', 'ff7f00'];
 Map.addLayer(mineralZones, {min: 0, max: 4, palette: zonePalette},
@@ -300,9 +302,9 @@ var s2Image = s2.median().clip(aoi);
 // Sentinel-2 equivalents of the Landsat ratios (B4=Red, B2=Blue,
 // B11=SWIR1, B12=SWIR2 — same interpretation as the OLI ratios above)
 var s2IronOxide = s2Image.select('B4').divide(s2Image.select('B2'))
-  .rename('S2_Iron_Oxide_Ratio');
+  .rename('S2_Iron_Oxide_Ratio').clip(aoi);
 var s2HydroxylClay = s2Image.select('B11').divide(s2Image.select('B12'))
-  .rename('S2_Hydroxyl_Clay_Ratio');
+  .rename('S2_Hydroxyl_Clay_Ratio').clip(aoi);
 
 Map.addLayer(s2HydroxylClay, ratioVis, 'Sentinel-2 Hydroxyl/Clay Ratio (B11/B12)', false);
 Map.addLayer(s2IronOxide, ratioVis, 'Sentinel-2 Iron Oxide Ratio (B4/B2)', false);
@@ -342,24 +344,24 @@ var asterImage = aster.median().clip(aoi);
 // Kaolinite Index: high -> kaolinite
 var kaoliniteIndex = asterImage.select('B04').divide(asterImage.select('B05'))
   .multiply(asterImage.select('B08').divide(asterImage.select('B06')))
-  .rename('ASTER_Kaolinite_Index');
+  .rename('ASTER_Kaolinite_Index').clip(aoi);
 
 // Alunite Index: high -> alunite
 var aluniteIndex = asterImage.select('B07').divide(asterImage.select('B05'))
   .multiply(asterImage.select('B04').divide(asterImage.select('B08')))
-  .rename('ASTER_Alunite_Index');
+  .rename('ASTER_Alunite_Index').clip(aoi);
 
 // AlOH / phyllosilicate index (muscovite-illite-sericite-kaolinite group,
 // after Ninomiya 2003): high -> generic clay/mica hydroxyl alteration,
 // this is the closest ASTER analogue to the Landsat/S2 hydroxyl ratio
 var asterOHIndex = asterImage.select('B05').add(asterImage.select('B07'))
   .divide(asterImage.select('B06'))
-  .rename('ASTER_AlOH_Index');
+  .rename('ASTER_AlOH_Index').clip(aoi);
 
 // Calcite/carbonate-chlorite-epidote index: high -> propylitic/carbonate
 var calciteIndex = asterImage.select('B06').add(asterImage.select('B09'))
   .divide(asterImage.select('B07').add(asterImage.select('B08')))
-  .rename('ASTER_Calcite_Index');
+  .rename('ASTER_Calcite_Index').clip(aoi);
 
 var asterVis = {min: 0.9, max: 1.3, palette: ['000004','3b0f70','8c2981','de4968','fe9f6d','fcfdbf']};
 Map.addLayer(asterOHIndex, asterVis, 'ASTER AlOH/Clay Index (B5+B7)/B6', false);
@@ -438,7 +440,8 @@ function normalize01(img, bandName, geom, scale) {
   });
   var min = ee.Number(mm.get(bandName + '_min'));
   var max = ee.Number(mm.get(bandName + '_max'));
-  return img.select(bandName).subtract(min).divide(max.subtract(min)).rename(bandName + '_norm');
+  return img.select(bandName).subtract(min).divide(max.subtract(min))
+    .rename(bandName + '_norm').clip(geom);
 }
 
 var ironOxide_n     = normalize01(ironOxide, 'Iron_Oxide_Ratio', aoi, 30);
@@ -452,7 +455,7 @@ var ferrous_n       = normalize01(ferrousMinerals, 'Ferrous_Mineral_Ratio', aoi,
 var goldVectorCore = ironOxide_n.multiply(0.45)
   .add(hydroxylClay_n.multiply(0.45))
   .add(ferrous_n.multiply(0.10))
-  .rename('Gold_Vector_Core');
+  .rename('Gold_Vector_Core').clip(aoi);
 
 Map.addLayer(goldVectorCore, {min: 0, max: 1, palette: ['1a1a2e','16213e','0f3460','e94560','ffbe0b']},
   'Gold Vector - Core (Landsat/S2)', false);
@@ -468,7 +471,7 @@ var asterOH_n   = normalize01(asterOHIndex, 'ASTER_AlOH_Index', aoi, 30);
 var goldVectorASTER = alunite_n.multiply(0.5)
   .add(kaolinite_n.multiply(0.3))
   .add(asterOH_n.multiply(0.2))
-  .rename('Gold_Vector_ASTER_Refinement');
+  .rename('Gold_Vector_ASTER_Refinement').clip(aoi);
 
 Map.addLayer(goldVectorASTER, {min: 0, max: 1, palette: ['1a1a2e','16213e','0f3460','e94560','ffbe0b']},
   'Gold Vector - ASTER Refinement (pre-2008 only)', false);
@@ -513,7 +516,7 @@ var structWeight = 0.3;
 
 var goldTargetPriority = goldVectorCore.multiply(altWeight)
   .add(lineamentDensity_n.multiply(structWeight))
-  .rename('Gold_Target_Priority');
+  .rename('Gold_Target_Priority').clip(aoi);
 
 var priorityStats = goldTargetPriority.reduceRegion({
   reducer: ee.Reducer.percentile([50, 75, 90]),
@@ -529,7 +532,7 @@ var goldPriorityClass = ee.Image(0)
   .where(goldTargetPriority.gt(p75), 2)
   .where(goldTargetPriority.gt(p90), 3)
   .rename('Gold_Priority_Class')
-  .updateMask(ee.Image(1));
+  .clip(aoi);
 
 var priorityPalette = ['f7fbff', 'c6dbef', 'fd8d3c', 'de2d26'];
 Map.addLayer(goldPriorityClass, {min: 0, max: 3, palette: priorityPalette},
@@ -551,8 +554,26 @@ goldLegendItems.forEach(function(item) {
 Map.add(goldLegend);
 
 // ============================================================
-// 15. EXPORTS
+// 15. EXPORTS — every layer produced above, all clipped to the study
+//     area boundary (region: aoi = the exact study_area polygon, not
+//     its bounding box; combined with the .clip(aoi) on each source
+//     image, pixels outside the boundary are masked/nodata in the
+//     GeoTIFF). Each task below still needs a manual "Run" click in
+//     the Tasks tab (Earth Engine does not auto-start exports).
 // ============================================================
+
+// 15.1 Landsat 8/9 true-color + false-color 6-5-4 visual reference
+Export.image.toDrive({
+  image: image.select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7']),
+  description: 'Landsat89_Composite_AllBands',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'landsat89_composite',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// 15.2 Standard hydrothermal alteration band ratios (section 5)
 Export.image.toDrive({
   image: ratioStack,
   description: 'Hydrothermal_Alteration_Ratios',
@@ -563,6 +584,41 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
+// 15.3 Sabins-style RGB alteration ratio composite (section 6)
+Export.image.toDrive({
+  image: alterationComposite,
+  description: 'Alteration_Ratio_Composite_RGB',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'alteration_ratio_composite',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// 15.4 Crosta-technique PCA components, iron-oxide and hydroxyl subsets
+//      (section 7) — inspect the eigenvector print-outs in the console
+//      to know which PC band is the real alteration index before use.
+Export.image.toDrive({
+  image: pcaFe.pcImage,
+  description: 'PCA_Iron_Oxide_Components',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'pca_iron_oxide',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+Export.image.toDrive({
+  image: pcaOH.pcImage,
+  description: 'PCA_Hydroxyl_Components',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'pca_hydroxyl',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// 15.5 Threshold-based mineral/alteration zonation map (section 8)
 Export.image.toDrive({
   image: mineralZones,
   description: 'Mineral_Alteration_Zonation_Map',
@@ -573,6 +629,18 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
+// 15.6 Sentinel-2 validation ratios (section 9)
+Export.image.toDrive({
+  image: s2IronOxide.addBands(s2HydroxylClay),
+  description: 'Sentinel2_Validation_Ratios',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'sentinel2_ratios',
+  region: aoi,
+  scale: 20,
+  maxPixels: 1e9
+});
+
+// 15.7 ASTER SWIR clay-mineral indices (section 10)
 Export.image.toDrive({
   image: asterOHIndex.addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex),
   description: 'ASTER_Clay_Mineral_Indices',
@@ -583,6 +651,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
+// 15.8 Cross-sensor clay/hydroxyl validation sample points (section 11)
 Export.table.toDrive({
   collection: samplePts,
   description: 'Clay_Hydroxyl_CrossSensor_Validation_Points',
@@ -591,6 +660,29 @@ Export.table.toDrive({
   fileFormat: 'CSV'
 });
 
+// 15.9 Gold vector layers, core + ASTER refinement (section 12)
+Export.image.toDrive({
+  image: goldVectorCore.addBands(goldVectorASTER),
+  description: 'Gold_Vector_Indices',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'gold_vector_indices',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// 15.10 Structural lineament density (section 13)
+Export.image.toDrive({
+  image: lineamentDensity.addBands(lineamentDensity_n),
+  description: 'Structural_Lineament_Density',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'lineament_density',
+  region: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// 15.11 Combined gold target priority map (section 14)
 Export.image.toDrive({
   image: goldTargetPriority.addBands(goldPriorityClass).addBands(lineamentDensity_n),
   description: 'Gold_Target_Priority_Map',
