@@ -491,23 +491,38 @@ var edges = ee.Algorithms.CannyEdgeDetector({image: hillshade, threshold: 10, si
 var lineaments = edges.updateMask(edges).clip(aoi);
 Map.addLayer(lineaments, {palette: ['ffffff']}, 'Structural Lineaments (Canny edges on hillshade)', false);
 
-// --- 13.1 Lineament raster -> point vector -----------------------------
-// Converts the binary edge raster to a point FeatureCollection: one
-// point at the centroid of every edge pixel, i.e. the full-resolution
-// (30 m) point representation of the fault/fracture network, usable
-// directly in GIS software (rose diagrams, point-density, nearest-
-// distance-to-lineament analysis, etc). .sample() only returns
-// features for unmasked pixels, so masking to the edges first (via
-// .selfMask()) means only true edge pixels come out as points -
-// background (non-edge) pixels are dropped, not returned as points.
-var lineamentPoints = lineaments.selfMask().sample({
-  region: aoi,
-  scale: 30,
-  geometries: true,
-  dropNulls: true
+// --- 13.1 Lineament raster -> vector (one feature per lineament) -------
+// Earth Engine has no built-in raster-to-polyline vectorizer:
+// reduceToVectors only outputs points, polygons, or bounding boxes.
+// Sampling every edge pixel (the earlier approach) gives one POINT per
+// PIXEL - technically a "point" export, but far too dense and not a
+// line. Fix: group 8-connected edge pixels into distinct lineament
+// segments first (connectedComponents), THEN vectorize each segment as
+// ONE polygon feature tracing its footprint - this collapses the count
+// from thousands of pixel-points down to the actual number of distinct
+// lineaments, and each feature is an elongated, line-shaped polygon
+// rather than a scattered point. If you need true LineString geometry
+// (not polygon) for downstream GIS use, run this polygon layer through
+// a centerline tool afterward (e.g. QGIS "Polygon to Centerline"
+// plugin, or GRASS v.to.lines) - that step isn't available inside GEE.
+var connectedEdges = edges.selfMask().connectedComponents({
+  connectedness: ee.Kernel.plus(1),
+  maxSize: 1024
 });
-print('Lineament point count (one point per edge pixel):', lineamentPoints.size());
-Map.addLayer(lineamentPoints, {color: 'ff0000'}, 'Lineament Points (vector)', false);
+
+var lineamentVectors = connectedEdges.select('labels').reduceToVectors({
+  geometry: aoi,
+  scale: 30,
+  geometryType: 'polygon',
+  eightConnected: true,
+  labelProperty: 'lineament_id',
+  maxPixels: 1e9,
+  bestEffort: true
+});
+print('Lineament vector feature count (one per distinct lineament segment):',
+  lineamentVectors.size());
+Map.addLayer(lineamentVectors.style({color: 'ff0000', fillColor: 'ff000080', width: 1}),
+  {}, 'Lineament Vectors (one feature per segment)', false);
 
 // Lineament density: sum of edge pixels in a 500 m-radius disk kernel
 // -> higher density = more fractured/faulted ground = better fluid
@@ -700,14 +715,15 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.10b Lineament points — vector (point) form of the fault/fracture
-// network (section 13.1). SHP is a standard GIS vector format; switch
-// fileFormat to 'GeoJSON' or 'KML' if you'd rather have those instead.
+// 15.10b Lineament vectors — one polygon feature per distinct lineament
+// segment (section 13.1), not one point per pixel. SHP is a standard
+// GIS vector format; switch fileFormat to 'GeoJSON' or 'KML' if you'd
+// rather have those instead.
 Export.table.toDrive({
-  collection: lineamentPoints,
-  description: 'Lineament_Points',
+  collection: lineamentVectors,
+  description: 'Lineament_Vectors',
   folder: 'GEE_exports',
-  fileNamePrefix: 'lineament_points',
+  fileNamePrefix: 'lineament_vectors',
   fileFormat: 'SHP'
 });
 
