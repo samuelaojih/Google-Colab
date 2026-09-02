@@ -575,7 +575,7 @@ Export.image.toDrive({
 
 // 15.2 Standard hydrothermal alteration band ratios (section 5)
 Export.image.toDrive({
-  image: ratioStack,
+  image: ratioStack.toDouble(),
   description: 'Hydrothermal_Alteration_Ratios',
   folder: 'GEE_exports',
   fileNamePrefix: 'alteration_ratios',
@@ -586,7 +586,7 @@ Export.image.toDrive({
 
 // 15.3 Sabins-style RGB alteration ratio composite (section 6)
 Export.image.toDrive({
-  image: alterationComposite,
+  image: alterationComposite.toDouble(),
   description: 'Alteration_Ratio_Composite_RGB',
   folder: 'GEE_exports',
   fileNamePrefix: 'alteration_ratio_composite',
@@ -599,7 +599,7 @@ Export.image.toDrive({
 //      (section 7) — inspect the eigenvector print-outs in the console
 //      to know which PC band is the real alteration index before use.
 Export.image.toDrive({
-  image: pcaFe.pcImage,
+  image: pcaFe.pcImage.toDouble(),
   description: 'PCA_Iron_Oxide_Components',
   folder: 'GEE_exports',
   fileNamePrefix: 'pca_iron_oxide',
@@ -609,7 +609,7 @@ Export.image.toDrive({
 });
 
 Export.image.toDrive({
-  image: pcaOH.pcImage,
+  image: pcaOH.pcImage.toDouble(),
   description: 'PCA_Hydroxyl_Components',
   folder: 'GEE_exports',
   fileNamePrefix: 'pca_hydroxyl',
@@ -631,7 +631,7 @@ Export.image.toDrive({
 
 // 15.6 Sentinel-2 validation ratios (section 9)
 Export.image.toDrive({
-  image: s2IronOxide.addBands(s2HydroxylClay),
+  image: s2IronOxide.addBands(s2HydroxylClay).toDouble(),
   description: 'Sentinel2_Validation_Ratios',
   folder: 'GEE_exports',
   fileNamePrefix: 'sentinel2_ratios',
@@ -642,7 +642,7 @@ Export.image.toDrive({
 
 // 15.7 ASTER SWIR clay-mineral indices (section 10)
 Export.image.toDrive({
-  image: asterOHIndex.addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex),
+  image: asterOHIndex.addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex).toDouble(),
   description: 'ASTER_Clay_Mineral_Indices',
   folder: 'GEE_exports',
   fileNamePrefix: 'aster_clay_indices',
@@ -662,7 +662,7 @@ Export.table.toDrive({
 
 // 15.9 Gold vector layers, core + ASTER refinement (section 12)
 Export.image.toDrive({
-  image: goldVectorCore.addBands(goldVectorASTER),
+  image: goldVectorCore.addBands(goldVectorASTER).toDouble(),
   description: 'Gold_Vector_Indices',
   folder: 'GEE_exports',
   fileNamePrefix: 'gold_vector_indices',
@@ -673,7 +673,7 @@ Export.image.toDrive({
 
 // 15.10 Structural lineament density (section 13)
 Export.image.toDrive({
-  image: lineamentDensity.toFloat().addBands(lineamentDensity_n),
+  image: lineamentDensity.addBands(lineamentDensity_n).toDouble(),
   description: 'Structural_Lineament_Density',
   folder: 'GEE_exports',
   fileNamePrefix: 'lineament_density',
@@ -684,7 +684,7 @@ Export.image.toDrive({
 
 // 15.11 Combined gold target priority map (section 14)
 Export.image.toDrive({
-  image: goldTargetPriority.addBands(goldPriorityClass.toFloat()).addBands(lineamentDensity_n),
+  image: goldTargetPriority.addBands(goldPriorityClass).addBands(lineamentDensity_n).toDouble(),
   description: 'Gold_Target_Priority_Map',
   folder: 'GEE_exports',
   fileNamePrefix: 'gold_target_priority',
