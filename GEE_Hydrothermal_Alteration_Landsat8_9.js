@@ -673,7 +673,7 @@ Export.image.toDrive({
 
 // 15.10 Structural lineament density (section 13)
 Export.image.toDrive({
-  image: lineamentDensity.addBands(lineamentDensity_n),
+  image: lineamentDensity.toFloat().addBands(lineamentDensity_n),
   description: 'Structural_Lineament_Density',
   folder: 'GEE_exports',
   fileNamePrefix: 'lineament_density',
@@ -684,7 +684,7 @@ Export.image.toDrive({
 
 // 15.11 Combined gold target priority map (section 14)
 Export.image.toDrive({
-  image: goldTargetPriority.addBands(goldPriorityClass).addBands(lineamentDensity_n),
+  image: goldTargetPriority.addBands(goldPriorityClass.toFloat()).addBands(lineamentDensity_n),
   description: 'Gold_Target_Priority_Map',
   folder: 'GEE_exports',
   fileNamePrefix: 'gold_target_priority',
