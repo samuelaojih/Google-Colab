@@ -491,6 +491,24 @@ var edges = ee.Algorithms.CannyEdgeDetector({image: hillshade, threshold: 10, si
 var lineaments = edges.updateMask(edges).clip(aoi);
 Map.addLayer(lineaments, {palette: ['ffffff']}, 'Structural Lineaments (Canny edges on hillshade)', false);
 
+// --- 13.1 Lineament raster -> point vector -----------------------------
+// Converts the binary edge raster to a point FeatureCollection: one
+// point at the centroid of every edge pixel, i.e. the full-resolution
+// (30 m) point representation of the fault/fracture network, usable
+// directly in GIS software (rose diagrams, point-density, nearest-
+// distance-to-lineament analysis, etc). .sample() only returns
+// features for unmasked pixels, so masking to the edges first (via
+// .selfMask()) means only true edge pixels come out as points -
+// background (non-edge) pixels are dropped, not returned as points.
+var lineamentPoints = lineaments.selfMask().sample({
+  region: aoi,
+  scale: 30,
+  geometries: true,
+  dropNulls: true
+});
+print('Lineament point count (one point per edge pixel):', lineamentPoints.size());
+Map.addLayer(lineamentPoints, {color: 'ff0000'}, 'Lineament Points (vector)', false);
+
 // Lineament density: sum of edge pixels in a 500 m-radius disk kernel
 // -> higher density = more fractured/faulted ground = better fluid
 // pathways for structurally controlled Au mineralization.
@@ -680,6 +698,17 @@ Export.image.toDrive({
   region: aoi,
   scale: 30,
   maxPixels: 1e9
+});
+
+// 15.10b Lineament points — vector (point) form of the fault/fracture
+// network (section 13.1). SHP is a standard GIS vector format; switch
+// fileFormat to 'GeoJSON' or 'KML' if you'd rather have those instead.
+Export.table.toDrive({
+  collection: lineamentPoints,
+  description: 'Lineament_Points',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'lineament_points',
+  fileFormat: 'SHP'
 });
 
 // 15.11 Combined gold target priority map (section 14)
