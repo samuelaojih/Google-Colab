@@ -223,7 +223,10 @@ Map.addLayer(pcaOH.pcImage.select(['PC1','PC2','PC3']), {min: -0.1, max: 0.1},
 //    if available.
 // ============================================================
 var stats = ratioStack.reduceRegion({
-  reducer: ee.Reducer.mean().combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true}),
+  reducer: ee.Reducer.mean()
+    .combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.minMax(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.percentile([25, 50, 75, 90]), sharedInputs: true}),
   geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
 });
 
@@ -587,7 +590,126 @@ goldLegendItems.forEach(function(item) {
 Map.add(goldLegend);
 
 // ============================================================
-// 15. EXPORTS — every layer produced above, all clipped to the study
+// 15. AREA & STATISTICS SUMMARY
+//     Everything here prints to the Console on run, and is also
+//     exported as CSV tables in section 16 so you have the numbers
+//     outside the Code Editor too.
+// ============================================================
+
+// --- 15.1 Total study area, for reference / percent calculations ---
+var totalAreaKm2 = ee.Number(aoi.area({maxError: 30})).divide(1e6);
+print('TOTAL STUDY AREA (km^2):', totalAreaKm2);
+
+// --- 15.2 Full descriptive statistics for every band ratio/index ---
+// (mean/stdDev/min/max/25th/50th/75th/90th percentile, computed over
+// the study area at 30 m). 'stats' already holds the 5 Landsat ratios
+// from section 8; this adds the same for the Sentinel-2, ASTER, and
+// gold-vector layers so every numeric layer has a printed statistics
+// row.
+var extraStatsImage = s2IronOxide.addBands(s2HydroxylClay)
+  .addBands(asterOHIndex).addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex)
+  .addBands(goldVectorCore).addBands(goldVectorASTER).addBands(lineamentDensity)
+  .addBands(goldTargetPriority);
+
+var extraStats = extraStatsImage.reduceRegion({
+  reducer: ee.Reducer.mean()
+    .combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.minMax(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.percentile([25, 50, 75, 90]), sharedInputs: true}),
+  geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
+});
+
+print('STATISTICS — Landsat band ratios (Iron Oxide, Ferrous, Hydroxyl/Clay, Gossan, Laterite):', stats);
+print('STATISTICS — Sentinel-2 / ASTER / gold-vector / lineament-density layers:', extraStats);
+
+// Flatten both stats dictionaries into one table (one row per band,
+// one column per statistic) for the CSV export in section 16.
+function statsToFeatureCollection(statsDict, bandNames) {
+  return ee.FeatureCollection(bandNames.map(function(name) {
+    var d = ee.Dictionary(statsDict);
+    return ee.Feature(null, {
+      'Band': name,
+      'Mean': d.get(name + '_mean', null),
+      'StdDev': d.get(name + '_stdDev', null),
+      'Min': d.get(name + '_min', null),
+      'Max': d.get(name + '_max', null),
+      'P25': d.get(name + '_p25', null),
+      'P50_Median': d.get(name + '_p50', null),
+      'P75': d.get(name + '_p75', null),
+      'P90': d.get(name + '_p90', null)
+    });
+  }));
+}
+
+var statsTable = statsToFeatureCollection(stats,
+  ['Iron_Oxide_Ratio', 'Ferrous_Mineral_Ratio', 'Hydroxyl_Clay_Ratio', 'Gossan_Ratio', 'Laterite_Ratio']
+).merge(statsToFeatureCollection(extraStats, [
+  'S2_Iron_Oxide_Ratio', 'S2_Hydroxyl_Clay_Ratio', 'ASTER_AlOH_Index', 'ASTER_Kaolinite_Index',
+  'ASTER_Alunite_Index', 'ASTER_Calcite_Index', 'Gold_Vector_Core', 'Gold_Vector_ASTER_Refinement',
+  'Lineament_Density', 'Gold_Target_Priority'
+]));
+print('Full statistics table (one row per band/index):', statsTable);
+
+// --- 15.3 Area covered by each Alteration Zone class (section 8) ---
+var zoneLabels = {
+  0: 'Background / unaltered',
+  1: 'Iron oxide (gossan) - limonite/hematite/goethite',
+  2: 'Argillic/phyllic - kaolinite/illite/sericite/alunite',
+  3: 'Propylitic - chlorite/epidote/biotite',
+  4: 'Advanced argillic (Fe-oxide + clay overlap)'
+};
+var zoneLabelDict = ee.Dictionary(zoneLabels);
+
+var pixelAreaKm2 = ee.Image.pixelArea().divide(1e6).rename('area');
+var zoneAreaGroups = ee.Dictionary(pixelAreaKm2.addBands(mineralZones).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'zone'}),
+  geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
+}));
+
+var zoneAreaTable = ee.FeatureCollection(ee.List(zoneAreaGroups.get('groups')).map(function(g) {
+  g = ee.Dictionary(g);
+  var zone = ee.Number(g.get('zone'));
+  var areaKm2 = ee.Number(g.get('sum'));
+  return ee.Feature(null, {
+    'Zone_ID': zone,
+    'Zone_Label': zoneLabelDict.get(zone.format('%d'), 'Unknown'),
+    'Area_km2': areaKm2,
+    'Area_hectares': areaKm2.multiply(100),
+    'Percent_of_Study_Area': areaKm2.divide(totalAreaKm2).multiply(100)
+  });
+}));
+print('AREA PER ALTERATION ZONE CLASS:', zoneAreaTable);
+
+// --- 15.4 Area covered by each Gold Target Priority class (section 14) ---
+var priorityLabels = {
+  0: 'Low (< median)',
+  1: 'Moderate (median-75th pct)',
+  2: 'High (75th-90th pct)',
+  3: 'Very High (> 90th pct)'
+};
+var priorityLabelDict = ee.Dictionary(priorityLabels);
+
+var priorityAreaGroups = ee.Dictionary(pixelAreaKm2.addBands(goldPriorityClass).reduceRegion({
+  reducer: ee.Reducer.sum().group({groupField: 1, groupName: 'priority'}),
+  geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
+}));
+
+var priorityAreaTable = ee.FeatureCollection(ee.List(priorityAreaGroups.get('groups')).map(function(g) {
+  g = ee.Dictionary(g);
+  var cls = ee.Number(g.get('priority'));
+  var areaKm2 = ee.Number(g.get('sum'));
+  return ee.Feature(null, {
+    'Priority_Class_ID': cls,
+    'Priority_Label': priorityLabelDict.get(cls.format('%d'), 'Unknown'),
+    'Area_km2': areaKm2,
+    'Area_hectares': areaKm2.multiply(100),
+    'Percent_of_Study_Area': areaKm2.divide(totalAreaKm2).multiply(100)
+  });
+}));
+print('AREA PER GOLD TARGET PRIORITY CLASS:', priorityAreaTable);
+
+// ============================================================
+// 16. EXPORTS — every layer produced above, all clipped to the study
 //     area boundary (region: aoi = the exact study_area polygon, not
 //     its bounding box; combined with the .clip(aoi) on each source
 //     image, pixels outside the boundary are masked/nodata in the
@@ -595,7 +717,7 @@ Map.add(goldLegend);
 //     the Tasks tab (Earth Engine does not auto-start exports).
 // ============================================================
 
-// 15.1 Landsat 8/9 true-color + false-color 6-5-4 visual reference
+// 16.1 Landsat 8/9 true-color + false-color 6-5-4 visual reference
 Export.image.toDrive({
   image: image.select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7']),
   description: 'Landsat89_Composite_AllBands',
@@ -606,7 +728,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.2 Standard hydrothermal alteration band ratios (section 5)
+// 16.2 Standard hydrothermal alteration band ratios (section 5)
 Export.image.toDrive({
   image: ratioStack.toDouble(),
   description: 'Hydrothermal_Alteration_Ratios',
@@ -617,7 +739,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.3 Sabins-style RGB alteration ratio composite (section 6)
+// 16.3 Sabins-style RGB alteration ratio composite (section 6)
 Export.image.toDrive({
   image: alterationComposite.toDouble(),
   description: 'Alteration_Ratio_Composite_RGB',
@@ -628,7 +750,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.4 Crosta-technique PCA components, iron-oxide and hydroxyl subsets
+// 16.4 Crosta-technique PCA components, iron-oxide and hydroxyl subsets
 //      (section 7) — inspect the eigenvector print-outs in the console
 //      to know which PC band is the real alteration index before use.
 Export.image.toDrive({
@@ -651,7 +773,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.5 Threshold-based mineral/alteration zonation map (section 8)
+// 16.5 Threshold-based mineral/alteration zonation map (section 8)
 Export.image.toDrive({
   image: mineralZones,
   description: 'Mineral_Alteration_Zonation_Map',
@@ -662,7 +784,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.6 Sentinel-2 validation ratios (section 9)
+// 16.6 Sentinel-2 validation ratios (section 9)
 Export.image.toDrive({
   image: s2IronOxide.addBands(s2HydroxylClay).toDouble(),
   description: 'Sentinel2_Validation_Ratios',
@@ -673,7 +795,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.7 ASTER SWIR clay-mineral indices (section 10)
+// 16.7 ASTER SWIR clay-mineral indices (section 10)
 Export.image.toDrive({
   image: asterOHIndex.addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex).toDouble(),
   description: 'ASTER_Clay_Mineral_Indices',
@@ -684,7 +806,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.8 Cross-sensor clay/hydroxyl validation sample points (section 11)
+// 16.8 Cross-sensor clay/hydroxyl validation sample points (section 11)
 Export.table.toDrive({
   collection: samplePts,
   description: 'Clay_Hydroxyl_CrossSensor_Validation_Points',
@@ -693,7 +815,34 @@ Export.table.toDrive({
   fileFormat: 'CSV'
 });
 
-// 15.9 Gold vector layers, core + ASTER refinement (section 12)
+// 16.8b Full statistics table for every band ratio/index (section 15.2)
+Export.table.toDrive({
+  collection: statsTable,
+  description: 'Band_Ratio_Statistics',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'band_ratio_statistics',
+  fileFormat: 'CSV'
+});
+
+// 16.8c Area per Alteration Zone class (section 15.3)
+Export.table.toDrive({
+  collection: zoneAreaTable,
+  description: 'Alteration_Zone_Areas',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'alteration_zone_areas',
+  fileFormat: 'CSV'
+});
+
+// 16.8d Area per Gold Target Priority class (section 15.4)
+Export.table.toDrive({
+  collection: priorityAreaTable,
+  description: 'Gold_Priority_Class_Areas',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'gold_priority_class_areas',
+  fileFormat: 'CSV'
+});
+
+// 16.9 Gold vector layers, core + ASTER refinement (section 12)
 Export.image.toDrive({
   image: goldVectorCore.addBands(goldVectorASTER).toDouble(),
   description: 'Gold_Vector_Indices',
@@ -704,7 +853,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.10 Structural lineament density (section 13)
+// 16.10 Structural lineament density (section 13)
 Export.image.toDrive({
   image: lineamentDensity.addBands(lineamentDensity_n).toDouble(),
   description: 'Structural_Lineament_Density',
@@ -715,7 +864,7 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 15.10b Lineament vectors — one polygon feature per distinct lineament
+// 16.10b Lineament vectors — one polygon feature per distinct lineament
 // segment (section 13.1), not one point per pixel. SHP is a standard
 // GIS vector format; switch fileFormat to 'GeoJSON' or 'KML' if you'd
 // rather have those instead.
@@ -727,7 +876,7 @@ Export.table.toDrive({
   fileFormat: 'SHP'
 });
 
-// 15.11 Combined gold target priority map (section 14)
+// 16.11 Combined gold target priority map (section 14)
 Export.image.toDrive({
   image: goldTargetPriority.addBands(goldPriorityClass).addBands(lineamentDensity_n).toDouble(),
   description: 'Gold_Target_Priority_Map',
