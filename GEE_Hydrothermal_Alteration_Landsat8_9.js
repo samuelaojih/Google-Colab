@@ -493,7 +493,14 @@ Map.addLayer(goldVectorASTER, {min: 0, max: 1, palette: ['1a1a2e','16213e','0f34
 var srtm = ee.Image('USGS/SRTMGL1_003').clip(aoi.buffer(2000));
 var hillshade = ee.Terrain.hillshade(srtm, 315, 45);
 
-var edges = ee.Algorithms.CannyEdgeDetector({image: hillshade, threshold: 10, sigma: 1});
+var edgesRaw = ee.Algorithms.CannyEdgeDetector({image: hillshade, threshold: 10, sigma: 1});
+// CannyEdgeDetector returns a continuous edge-STRENGTH image, not clean 0/1 -
+// binarize it here so every downstream pixel-counting operation (connected-
+// component labeling, the 3x3 neighbor count in 13.4) counts actual edge
+// PIXELS rather than summing fractional strengths. Without this, "3+ edge
+// neighbors" silently becomes "combined neighbor strength >= 3", which is
+// almost unreachable and returns zero junctions everywhere.
+var edges = edgesRaw.gt(0);
 var lineaments = edges.updateMask(edges).clip(aoi);
 Map.addLayer(lineaments, {palette: ['ffffff']}, 'Structural Lineaments (Canny edges on hillshade)', false);
 
