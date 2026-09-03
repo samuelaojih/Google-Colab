@@ -505,7 +505,7 @@ Map.addLayer(lineaments, {palette: ['ffffff']}, 'Structural Lineaments (Canny ed
 // (not polygon) for downstream GIS use, run this polygon layer through
 // a centerline tool afterward (e.g. QGIS "Polygon to Centerline"
 // plugin, or GRASS v.to.lines) - that step isn't available inside GEE.
-var connectedEdges = edges.selfMask().connectedComponents({
+var connectedEdges = edges.selfMask().int32().connectedComponents({
   connectedness: ee.Kernel.plus(1),
   maxSize: 1024
 });
