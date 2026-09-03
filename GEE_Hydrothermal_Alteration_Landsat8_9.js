@@ -16,8 +16,11 @@
  *              higher-res) and ASTER SWIR indices (Ninomiya 2003/2005 —
  *              mineral-species-resolving), a gold-specific weighted
  *              alteration vector, a DEM-derived structural lineament
- *              (fault/fracture) density layer, and a combined Gold
- *              Target Priority map.
+ *              (fault/fracture) vector/density layer with length
+ *              statistics, an orientation (rose-diagram) histogram,
+ *              a junction/intersection density layer, an area-per-
+ *              class and full descriptive-statistics summary, and a
+ *              combined Gold Target Priority map.
  *
  * Paste this whole script into code.earthengine.google.com and run.
  *
@@ -539,6 +542,112 @@ var lineamentDensity_n = normalize01(lineamentDensity, 'Lineament_Density', aoi,
 Map.addLayer(lineamentDensity_n, {min: 0, max: 1, palette: ['ffffff','fee08b','d73027']},
   'Lineament Density (structural control proxy)', false);
 
+// --- 13.2 Lineament length & count statistics ---------------------------
+// Approximates each lineament segment's length from its polygon
+// perimeter (perimeter ~ 2 x length for a thin, elongated footprint,
+// since the width is only ~1 pixel = 30 m and negligible next to
+// length for most segments). Adds Length_m and Area_m2 properties to
+// every feature, then summarizes count/total/mean/min/max length —
+// this is the standard raster-proxy approach; for publication-grade
+// length statistics, digitize centerlines in GIS from the exported
+// polygon layer instead.
+var lineamentVectorsWithLength = lineamentVectors.map(function(f) {
+  var perimeterM = f.geometry().perimeter({maxError: 1});
+  var areaM2 = f.geometry().area({maxError: 1});
+  var lengthM = ee.Number(perimeterM).divide(2);
+  return f.set({'Length_m': lengthM, 'Area_m2': areaM2});
+});
+
+var lengthStats = lineamentVectorsWithLength.aggregate_stats('Length_m');
+print('LINEAMENT LENGTH STATISTICS (meters) - count/mean/min/max/stdDev/sum:', lengthStats);
+
+var totalLineamentLengthKm = ee.Number(lineamentVectorsWithLength.aggregate_sum('Length_m')).divide(1000);
+var studyAreaKm2ForLineaments = ee.Number(aoi.area({maxError: 30})).divide(1e6);
+print('TOTAL LINEAMENT LENGTH (km):', totalLineamentLengthKm);
+print('NUMBER OF DISTINCT LINEAMENTS:', lineamentVectorsWithLength.size());
+print('LINEAMENT LENGTH DENSITY (km of lineament per km^2 of study area):',
+  totalLineamentLengthKm.divide(studyAreaKm2ForLineaments));
+
+// --- 13.3 Lineament orientation / rose diagram data ---------------------
+// Computes the local tangent (strike) direction at every edge pixel
+// from the hillshade gradient (a lineament runs perpendicular to the
+// brightness gradient crossing it), bins azimuths into 10-degree bins
+// from 0-180 (a line has no directionality — a 045 trend and a 225
+// trend are the same feature, so azimuths are folded mod 180), and
+// summarizes as a frequency table. GEE has no native polar/rose chart
+// widget — export the histogram CSV and plot it in Python/Excel/
+// GeoRose, or share the exported table back and it can be rendered
+// as an actual rose diagram.
+var grad = hillshade.gradient(); // bands: x, y
+var gradientAngleDeg = grad.select('y').atan2(grad.select('x'))
+  .multiply(180 / Math.PI); // degrees, -180..180: direction of steepest ascent
+
+var strikeDeg = gradientAngleDeg.add(90).add(360).mod(180)
+  .rename('Strike_Deg')
+  .updateMask(edges); // restrict to edge (lineament) pixels only
+
+Map.addLayer(strikeDeg, {min: 0, max: 180, palette: ['440154','3b528b','21918c','5ec962','fde725']},
+  'Lineament Strike Direction (deg, 0-180)', false);
+
+var binWidth = 10;
+var strikeBin = strikeDeg.divide(binWidth).floor().multiply(binWidth).toInt()
+  .rename('Strike_Bin');
+
+var strikeHistogram = ee.Dictionary(strikeBin.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: aoi, scale: 30, maxPixels: 1e9, bestEffort: true
+}).get('Strike_Bin'));
+
+print('LINEAMENT ORIENTATION HISTOGRAM (10-degree bins, pixel counts — rose diagram data):',
+  strikeHistogram);
+
+var strikeHistogramTable = ee.FeatureCollection(strikeHistogram.keys().map(function(k) {
+  var binStart = ee.Number.parse(k);
+  return ee.Feature(null, {
+    'Bin_Start_Deg': binStart,
+    'Bin_Range': binStart.format('%d').cat('-').cat(binStart.add(binWidth).format('%d')),
+    'Pixel_Count': strikeHistogram.get(k)
+  });
+}));
+print('Orientation histogram table (rose diagram data):', strikeHistogramTable);
+
+// Dominant orientation = the bin with the highest pixel count.
+var strikeKeys = strikeHistogram.keys();
+var strikeCounts = strikeKeys.map(function(k) { return strikeHistogram.get(k); });
+var maxStrikeCount = ee.Number(ee.List(strikeCounts).reduce(ee.Reducer.max()));
+var dominantBinIndex = ee.List(strikeCounts).indexOf(maxStrikeCount);
+var dominantBinStart = ee.Number.parse(ee.List(strikeKeys).get(dominantBinIndex));
+print('DOMINANT LINEAMENT ORIENTATION (10-degree bin, degrees from north):',
+  dominantBinStart.format('%d').cat('-').cat(dominantBinStart.add(binWidth).format('%d')).cat(' degrees'));
+
+// --- 13.4 Structural intersection / junction density ---------------------
+// Approximates fracture intersections as "branch points" in the edge
+// network — pixels with 3+ edge neighbors in a 3x3 window (a simple
+// line pixel has ~2 edge neighbors; a junction/intersection has 3+).
+// This is the standard raster proxy for true line-intersection
+// counting, which needs true LineString geometry that GEE can't
+// natively produce (see the note in section 13.1).
+var edgeNeighborCount = edges.unmask(0).reduceNeighborhood({
+  reducer: ee.Reducer.sum(), kernel: ee.Kernel.square(1)
+}).subtract(edges.unmask(0)); // exclude the center pixel from its own neighbor count
+
+var junctions = edgeNeighborCount.gte(3).and(edges.unmask(0)).selfMask()
+  .rename('Junction').clip(aoi);
+
+var junctionPoints = junctions.sample({
+  region: aoi, scale: 30, geometries: true, dropNulls: true
+});
+print('STRUCTURAL INTERSECTION/JUNCTION POINT COUNT:', junctionPoints.size());
+Map.addLayer(junctionPoints, {color: '00e5ff'}, 'Lineament Intersections/Junctions', false);
+
+var junctionDensity = junctions.unmask(0).reduceNeighborhood({
+  reducer: ee.Reducer.sum(), kernel: kernel // reuse the 500 m circle kernel from 13.1
+}).rename('Junction_Density').clip(aoi);
+
+var junctionDensity_n = normalize01(junctionDensity, 'Junction_Density', aoi, 30);
+Map.addLayer(junctionDensity_n, {min: 0, max: 1, palette: ['ffffff','a1d99b','238b45']},
+  'Structural Intersection Density (junctions per 500m radius)', false);
+
 // ============================================================
 // 14. COMBINED GOLD TARGET PRIORITY MAP
 //     Weighted sum of the alteration vector and structural density.
@@ -608,7 +717,7 @@ print('TOTAL STUDY AREA (km^2):', totalAreaKm2);
 // row.
 var extraStatsImage = s2IronOxide.addBands(s2HydroxylClay)
   .addBands(asterOHIndex).addBands(kaoliniteIndex).addBands(aluniteIndex).addBands(calciteIndex)
-  .addBands(goldVectorCore).addBands(goldVectorASTER).addBands(lineamentDensity)
+  .addBands(goldVectorCore).addBands(goldVectorASTER).addBands(lineamentDensity).addBands(junctionDensity)
   .addBands(goldTargetPriority);
 
 var extraStats = extraStatsImage.reduceRegion({
@@ -646,7 +755,7 @@ var statsTable = statsToFeatureCollection(stats,
 ).merge(statsToFeatureCollection(extraStats, [
   'S2_Iron_Oxide_Ratio', 'S2_Hydroxyl_Clay_Ratio', 'ASTER_AlOH_Index', 'ASTER_Kaolinite_Index',
   'ASTER_Alunite_Index', 'ASTER_Calcite_Index', 'Gold_Vector_Core', 'Gold_Vector_ASTER_Refinement',
-  'Lineament_Density', 'Gold_Target_Priority'
+  'Lineament_Density', 'Junction_Density', 'Gold_Target_Priority'
 ]));
 print('Full statistics table (one row per band/index):', statsTable);
 
@@ -853,9 +962,10 @@ Export.image.toDrive({
   maxPixels: 1e9
 });
 
-// 16.10 Structural lineament density (section 13)
+// 16.10 Structural lineament + intersection density (section 13, 13.4)
 Export.image.toDrive({
-  image: lineamentDensity.addBands(lineamentDensity_n).toDouble(),
+  image: lineamentDensity.addBands(lineamentDensity_n)
+    .addBands(junctionDensity).addBands(junctionDensity_n).toDouble(),
   description: 'Structural_Lineament_Density',
   folder: 'GEE_exports',
   fileNamePrefix: 'lineament_density',
@@ -865,14 +975,34 @@ Export.image.toDrive({
 });
 
 // 16.10b Lineament vectors — one polygon feature per distinct lineament
-// segment (section 13.1), not one point per pixel. SHP is a standard
-// GIS vector format; switch fileFormat to 'GeoJSON' or 'KML' if you'd
-// rather have those instead.
+// segment (section 13.1), WITH Length_m/Area_m2 attributes (section
+// 13.2), not one point per pixel. SHP is a standard GIS vector format;
+// switch fileFormat to 'GeoJSON' or 'KML' if you'd rather have those.
 Export.table.toDrive({
-  collection: lineamentVectors,
+  collection: lineamentVectorsWithLength,
   description: 'Lineament_Vectors',
   folder: 'GEE_exports',
   fileNamePrefix: 'lineament_vectors',
+  fileFormat: 'SHP'
+});
+
+// 16.10c Lineament orientation histogram (section 13.3) — the rose
+// diagram data. Plot Bin_Range (x-axis, as a polar/rose axis) against
+// Pixel_Count (radius) in Python/Excel/GeoRose, or share this CSV back.
+Export.table.toDrive({
+  collection: strikeHistogramTable,
+  description: 'Lineament_Orientation_Histogram',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'lineament_orientation_histogram',
+  fileFormat: 'CSV'
+});
+
+// 16.10d Structural intersection/junction points (section 13.4)
+Export.table.toDrive({
+  collection: junctionPoints,
+  description: 'Lineament_Intersections',
+  folder: 'GEE_exports',
+  fileNamePrefix: 'lineament_intersections',
   fileFormat: 'SHP'
 });
 
@@ -959,4 +1089,33 @@ Export.image.toDrive({
  *                                 with mapping, soil/rock geochemistry, or
  *                                 hyperspectral data before committing
  *                                 exploration budget.
+ *
+ * STRUCTURAL / LINEAMENT ANALYSIS (sections 13.1-13.4)
+ * Lineament Vectors               One polygon feature per distinct 8-connected
+ *                                 edge segment (Length_m + Area_m2 attributes),
+ *                                 not one point per pixel — see the printed
+ *                                 "NUMBER OF DISTINCT LINEAMENTS" and "TOTAL
+ *                                 LINEAMENT LENGTH (km)" for the count/length.
+ * Lineament Length Density        Total lineament length (km) divided by study
+ *                                 area (km^2) — a standard structural-geology
+ *                                 metric, independent of the raster kernel-
+ *                                 density map.
+ * Orientation Histogram           Strike direction (0-180 deg) of every edge
+ *                                 pixel, from the hillshade gradient's tangent,
+ *                                 binned every 10 degrees — this IS the rose-
+ *                                 diagram data (GEE has no native polar chart
+ *                                 widget, so plot the exported CSV in Python/
+ *                                 Excel/GeoRose). "DOMINANT LINEAMENT
+ *                                 ORIENTATION" in the console names the modal
+ *                                 10-degree bin.
+ * Junctions / Intersections       Pixels with 3+ edge neighbors (branch points
+ *                                 in the edge network) — the raster proxy for
+ *                                 line-intersection counting, since GEE can't
+ *                                 natively produce true LineString geometry to
+ *                                 test pairwise intersections directly.
+ * Junction Density                Same 500 m-radius kernel-sum technique as
+ *                                 Lineament Density, but counting junctions —
+ *                                 a structural-complexity proxy: zones of many
+ *                                 crossing fractures score higher than zones
+ *                                 with the same edge density but no crossings.
  */
