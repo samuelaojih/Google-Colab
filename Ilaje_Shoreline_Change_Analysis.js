@@ -1,6 +1,6 @@
 // ============================================================================
 // ILAJE LGA SHORELINE CHANGE ANALYSIS
-// 1986 - 2026
+// 1986 - 2026 (annual)
 // ============================================================================
 //
 // STUDY AREA:
@@ -10,7 +10,9 @@
 // projects/ee-samuelcoolsdk/assets/Ilaje_coastline
 //
 // METHODS:
-// MNDWI-based Landsat shoreline extraction
+// MNDWI-based Landsat shoreline extraction, run for every year in the
+// study period so sparse years (imagery is especially thin 1994-1999)
+// can be inspected on the map and manually included or excluded.
 // 2023 shoreline as reference baseline
 // 100 m transects
 // NSM
@@ -36,15 +38,32 @@ var shoreline2023Asset = ee.FeatureCollection(
 var aoi = studyArea.geometry();
 
 
-// Years
-var years = [
-  1986,
-  1996,
-  2006,
-  2016,
-  2023,
-  2026
-];
+// Study period - every year in this range is extracted
+var startYear = 1986;
+var endYear = 2026;
+
+var years = [];
+
+for (var yr = startYear; yr <= endYear; yr++) {
+  years.push(yr);
+}
+
+
+// ----------------------------------------------------------------------
+// Years used for the change statistics (NSM / EPR / SCE / LRR) and for
+// the "Complete transects" filter below.
+//
+// Every year from startYear-endYear is extracted and added to the map
+// (as hidden layers) further down, along with a printed scene count.
+// Landsat coverage is thin for several years - especially 1994-1999,
+// before Landsat 7 launched - so open the layer list, toggle the
+// "Shoreline Edge YYYY" / "Landsat Shoreline YYYY" layers on, check the
+// scene counts printed to the console, and edit this list down to only
+// the years whose extracted shoreline looks reliable before trusting
+// the statistics/export sections below.
+// ----------------------------------------------------------------------
+
+var analysisYears = years;
 
 
 // Transect spacing
@@ -275,171 +294,7 @@ function maskLandsat(image) {
 
 
 // ============================================================================
-// 9. LANDSAT 5
-// ============================================================================
-
-function getLandsat5(year) {
-
-  var collection = ee.ImageCollection(
-    'LANDSAT/LT05/C02/T1_L2'
-  )
-
-  .filterBounds(
-    aoi
-  )
-
-  .filterDate(
-    ee.Date.fromYMD(year, 1, 1),
-    ee.Date.fromYMD(year + 1, 1, 1)
-  )
-
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  );
-
-
-  print(
-    'Landsat 5 scenes - ' + year + ':',
-    collection.size()
-  );
-
-
-  return collection.median();
-}
-
-
-// ============================================================================
-// 10. LANDSAT 7
-// ============================================================================
-
-function getLandsat7(year) {
-
-  var collection = ee.ImageCollection(
-    'LANDSAT/LE07/C02/T1_L2'
-  )
-
-  .filterBounds(
-    aoi
-  )
-
-  .filterDate(
-    ee.Date.fromYMD(year, 1, 1),
-    ee.Date.fromYMD(year + 1, 1, 1)
-  )
-
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  );
-
-
-  print(
-    'Landsat 7 scenes - ' + year + ':',
-    collection.size()
-  );
-
-
-  return collection.median();
-}
-
-
-// ============================================================================
-// 11. LANDSAT 8
-// ============================================================================
-
-function getLandsat8(year) {
-
-  var collection = ee.ImageCollection(
-    'LANDSAT/LC08/C02/T1_L2'
-  )
-
-  .filterBounds(
-    aoi
-  )
-
-  .filterDate(
-    ee.Date.fromYMD(year, 1, 1),
-    ee.Date.fromYMD(year + 1, 1, 1)
-  )
-
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  );
-
-
-  print(
-    'Landsat 8 scenes - ' + year + ':',
-    collection.size()
-  );
-
-
-  return collection.median();
-}
-
-
-// ============================================================================
-// 12. LANDSAT 9
-// ============================================================================
-
-function getLandsat9(year) {
-
-  var collection = ee.ImageCollection(
-    'LANDSAT/LC09/C02/T1_L2'
-  )
-
-  .filterBounds(
-    aoi
-  )
-
-  .filterDate(
-    ee.Date.fromYMD(year, 1, 1),
-    ee.Date.fromYMD(year + 1, 1, 1)
-  )
-
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  );
-
-
-  print(
-    'Landsat 9 scenes - ' + year + ':',
-    collection.size()
-  );
-
-
-  return collection.median();
-}
-
-
-// ============================================================================
-// 13. PREPARE MNDWI BANDS
+// 9. STANDARDISE BANDS ACROSS SENSORS
 // ============================================================================
 //
 // Landsat 5/7:
@@ -452,7 +307,7 @@ function getLandsat9(year) {
 //
 // ============================================================================
 
-function prepare57(image) {
+function rename57(image) {
 
   return image.select(
     [
@@ -467,7 +322,7 @@ function prepare57(image) {
 }
 
 
-function prepare89(image) {
+function rename89(image) {
 
   return image.select(
     [
@@ -483,118 +338,90 @@ function prepare89(image) {
 
 
 // ============================================================================
-// 14. GET IMAGE FOR EACH YEAR
+// 10. BUILD A MERGED LANDSAT COLLECTION FOR ANY GIVEN YEAR
+// ============================================================================
+//
+// Every archive (L5, L7, L8, L9) is queried for every year. A collection
+// that has no scenes for a given year (because the sensor was not yet
+// launched, or had already been retired) simply comes back empty and
+// contributes nothing to the merge - so years that straddle two sensors
+// (e.g. 1999-2012, 2013-2022) automatically combine both.
+//
 // ============================================================================
 
-function getAnnualImage(year) {
+function getYearlyCollection(year) {
 
-  if (year <= 1999) {
+  var start =
+    ee.Date.fromYMD(year, 1, 1);
 
-    return prepare57(
-      getLandsat5(year)
-    );
-
-  }
+  var end =
+    ee.Date.fromYMD(year + 1, 1, 1);
 
 
-  if (year <= 2012) {
+  function loadCollection(id) {
 
-    return prepare57(
-      getLandsat7(year)
-    );
-
-  }
-
-
-  if (year <= 2021) {
-
-    return prepare89(
-      getLandsat8(year)
-    );
+    return ee.ImageCollection(id)
+      .filterBounds(aoi)
+      .filterDate(start, end)
+      .filter(
+        ee.Filter.lt(
+          'CLOUD_COVER',
+          cloudThreshold
+        )
+      )
+      .map(maskLandsat);
 
   }
 
 
-  // 2026
-  var landsat8 = ee.ImageCollection(
-    'LANDSAT/LC08/C02/T1_L2'
-  )
+  var landsat5 =
+    loadCollection('LANDSAT/LT05/C02/T1_L2')
+      .map(rename57);
 
-  .filterBounds(aoi)
+  var landsat7 =
+    loadCollection('LANDSAT/LE07/C02/T1_L2')
+      .map(rename57);
 
-  .filterDate(
-    '2026-01-01',
-    '2027-01-01'
-  )
+  var landsat8 =
+    loadCollection('LANDSAT/LC08/C02/T1_L2')
+      .map(rename89);
 
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  )
-
-  .map(
-    prepare89
-  );
+  var landsat9 =
+    loadCollection('LANDSAT/LC09/C02/T1_L2')
+      .map(rename89);
 
 
-  var landsat9 = ee.ImageCollection(
-    'LANDSAT/LC09/C02/T1_L2'
-  )
-
-  .filterBounds(aoi)
-
-  .filterDate(
-    '2026-01-01',
-    '2027-01-01'
-  )
-
-  .filter(
-    ee.Filter.lt(
-      'CLOUD_COVER',
-      cloudThreshold
-    )
-  )
-
-  .map(
-    maskLandsat
-  )
-
-  .map(
-    prepare89
-  );
+  var merged =
+    landsat5
+      .merge(landsat7)
+      .merge(landsat8)
+      .merge(landsat9);
 
 
   print(
-    'Landsat 8 scenes - 2026:',
-    landsat8.size()
-  );
-
-  print(
-    'Landsat 9 scenes - 2026:',
-    landsat9.size()
+    'Landsat scenes - ' + year + ':',
+    merged.size()
   );
 
 
-  return landsat8
-    .merge(landsat9)
-    .median();
+  return merged;
+}
+
+
+function getYearlyImage(year) {
+
+  return getYearlyCollection(year).median();
 }
 
 
 // ============================================================================
-// 15. EXTRACT SHORELINE FROM LANDSAT
+// 11. EXTRACT SHORELINE FROM LANDSAT
 // ============================================================================
 
 function extractShoreline(year) {
 
   var image =
-    getAnnualImage(year);
+    getYearlyImage(year);
 
 
   // ----------------------------------------------------------
@@ -714,7 +541,7 @@ function extractShoreline(year) {
 
 
   // ----------------------------------------------------------
-  // Display
+  // Display (hidden by default - toggle on to inspect a year)
   // ----------------------------------------------------------
 
   Map.addLayer(
@@ -751,45 +578,28 @@ function extractShoreline(year) {
 
 
 // ============================================================================
-// 16. EXTRACT HISTORICAL SHORELINES
+// 12. EXTRACT EVERY YEAR IN THE STUDY PERIOD
 // ============================================================================
 
-var shoreline1986 =
-  extractShoreline(
-    1986
-  );
+var shorelinesByYear = {};
 
+for (var i = 0; i < years.length; i++) {
 
-var shoreline1996 =
-  extractShoreline(
-    1996
-  );
+  var extractionYear = years[i];
 
+  shorelinesByYear[extractionYear] =
+    extractShoreline(extractionYear);
 
-var shoreline2006 =
-  extractShoreline(
-    2006
-  );
-
-
-var shoreline2016 =
-  extractShoreline(
-    2016
-  );
-
-
-var shoreline2026 =
-  extractShoreline(
-    2026
-  );
+}
 
 
 // ============================================================================
-// 17. CONVERT 2023 REFERENCE LINE TO POINTS
+// 13. CONVERT 2023 REFERENCE LINE TO POINTS
 // ============================================================================
 //
-// We retain the original 2023 line for the baseline.
-// Points are used only for intersection/position measurements.
+// The surveyed 2023 asset is more reliable than an MNDWI extraction, so
+// it overrides the Landsat-derived 2023 shoreline for the distance
+// measurements below (see section 17).
 //
 // ============================================================================
 
@@ -814,7 +624,7 @@ var shoreline2023Points =
 
 
 // ============================================================================
-// 18. CREATE 100-M TRANSECT ORIGIN POINTS
+// 14. CREATE 100-M TRANSECT ORIGIN POINTS
 // ============================================================================
 //
 // Use the 2023 coastline geometry as the reference.
@@ -856,7 +666,7 @@ var distances =
 
 
 // ============================================================================
-// 19. CREATE POINTS ALONG REFERENCE COASTLINE
+// 15. CREATE POINTS ALONG REFERENCE COASTLINE
 // ============================================================================
 //
 // Earth Engine's cutLines creates approximately equally spaced pieces.
@@ -879,7 +689,7 @@ var segmentGeometries =
 
 
 // ============================================================================
-// 20. CREATE MIDPOINTS
+// 16. CREATE MIDPOINTS
 // ============================================================================
 
 var baselinePoints =
@@ -918,7 +728,7 @@ var baselinePoints =
 
 
 // ============================================================================
-// 21. DISPLAY BASELINE POINTS
+// 17. DISPLAY BASELINE POINTS
 // ============================================================================
 
 Map.addLayer(
@@ -939,7 +749,7 @@ print(
 
 
 // ============================================================================
-// 22. CREATE PERPENDICULAR TRANSECTS
+// 18. CREATE PERPENDICULAR TRANSECTS
 // ============================================================================
 //
 // Each baseline point is used to create a local perpendicular transect.
@@ -1150,7 +960,7 @@ var transects =
 
 
 // ============================================================================
-// 23. CLIP TRANSECTS TO ILAJE
+// 19. CLIP TRANSECTS TO ILAJE
 // ============================================================================
 
 transects =
@@ -1175,7 +985,7 @@ transects =
 
 
 // ============================================================================
-// 24. DISPLAY TRANSECTS
+// 20. DISPLAY TRANSECTS
 // ============================================================================
 
 Map.addLayer(
@@ -1190,7 +1000,7 @@ Map.addLayer(
 
 
 // ============================================================================
-// 25. MEASURE DISTANCE FROM TRANSECT TO SHORELINE
+// 21. MEASURE DISTANCE FROM TRANSECT TO SHORELINE
 // ============================================================================
 //
 // The distance between the transect and the nearest shoreline point is
@@ -1273,41 +1083,26 @@ function addShorelineDistance(
 
 
 // ============================================================================
-// 26. MEASURE ALL SHORELINE POSITIONS
+// 22. MEASURE SHORELINE POSITION FOR EVERY YEAR
 // ============================================================================
 
-var measurements =
-  addShorelineDistance(
-    transects,
-    shoreline1986,
-    1986
-  );
+var measurements = transects;
+
+for (var j = 0; j < years.length; j++) {
+
+  var measureYear = years[j];
+
+  measurements =
+    addShorelineDistance(
+      measurements,
+      shorelinesByYear[measureYear],
+      measureYear
+    );
+
+}
 
 
-measurements =
-  addShorelineDistance(
-    measurements,
-    shoreline1996,
-    1996
-  );
-
-
-measurements =
-  addShorelineDistance(
-    measurements,
-    shoreline2006,
-    2006
-  );
-
-
-measurements =
-  addShorelineDistance(
-    measurements,
-    shoreline2016,
-    2016
-  );
-
-
+// Override 2023 with the surveyed reference line
 measurements =
   addShorelineDistance(
     measurements,
@@ -1316,124 +1111,106 @@ measurements =
   );
 
 
-measurements =
-  addShorelineDistance(
-    measurements,
-    shoreline2026,
-    2026
-  );
-
-
 // ============================================================================
-// 27. CALCULATE SHORELINE CHANGE
+// 23. CALCULATE SHORELINE CHANGE OVER THE SELECTED YEARS
 // ============================================================================
+//
+// Only "analysisYears" (edited in section 1 after reviewing the map)
+// feeds into NSM, EPR, SCE and LRR - so a sparse year that was left out
+// simply does not affect these statistics.
+//
+// ============================================================================
+
+var firstYear =
+  analysisYears[0];
+
+var lastYear =
+  analysisYears[analysisYears.length - 1];
+
 
 var results =
   measurements.map(
     function(feature) {
 
-      var d86 =
-        ee.Number(
-          feature.get(
-            'D_1986'
-          )
-        );
-
-      var d96 =
-        ee.Number(
-          feature.get(
-            'D_1996'
-          )
-        );
-
-      var d06 =
-        ee.Number(
-          feature.get(
-            'D_2006'
-          )
-        );
-
-      var d16 =
-        ee.Number(
-          feature.get(
-            'D_2016'
-          )
-        );
-
-      var d23 =
-        ee.Number(
-          feature.get(
-            'D_2023'
-          )
-        );
-
-      var d26 =
-        ee.Number(
-          feature.get(
-            'D_2026'
-          )
-        );
+      var props = {};
 
 
       // --------------------------------------------------------
-      // NSM
+      // Per-consecutive-year NSM / EPR, using whatever gap
+      // separates each pair of selected years.
       // --------------------------------------------------------
 
-      var nsm8696 =
-        d96.subtract(d86);
+      for (var k = 0; k < analysisYears.length - 1; k++) {
 
-      var nsm9606 =
-        d06.subtract(d96);
+        var yearA = analysisYears[k];
+        var yearB = analysisYears[k + 1];
 
-      var nsm0616 =
-        d16.subtract(d06);
+        var distanceA =
+          ee.Number(
+            feature.get('D_' + yearA)
+          );
 
-      var nsm1623 =
-        d23.subtract(d16);
+        var distanceB =
+          ee.Number(
+            feature.get('D_' + yearB)
+          );
 
-      var nsm2326 =
-        d26.subtract(d23);
+        var periodNsm =
+          distanceB.subtract(distanceA);
 
-      var nsm8626 =
-        d26.subtract(d86);
+        var periodEpr =
+          periodNsm.divide(yearB - yearA);
 
+        props['NSM_' + yearA + '_' + yearB + '_m'] =
+          periodNsm;
 
-      // --------------------------------------------------------
-      // EPR
-      // --------------------------------------------------------
+        props['EPR_' + yearA + '_' + yearB + '_m_yr'] =
+          periodEpr;
 
-      var epr8696 =
-        nsm8696.divide(10);
-
-      var epr9606 =
-        nsm9606.divide(10);
-
-      var epr0616 =
-        nsm0616.divide(10);
-
-      var epr1623 =
-        nsm1623.divide(7);
-
-      var epr2326 =
-        nsm2326.divide(3);
-
-      var epr8626 =
-        nsm8626.divide(40);
+      }
 
 
       // --------------------------------------------------------
-      // SCE
+      // Overall NSM / EPR across the full selected range
+      // --------------------------------------------------------
+
+      var firstDistance =
+        ee.Number(
+          feature.get('D_' + firstYear)
+        );
+
+      var lastDistance =
+        ee.Number(
+          feature.get('D_' + lastYear)
+        );
+
+      var overallNsm =
+        lastDistance.subtract(firstDistance);
+
+      var overallEpr =
+        overallNsm.divide(lastYear - firstYear);
+
+      props['NSM_' + firstYear + '_' + lastYear + '_m'] =
+        overallNsm;
+
+      props['EPR_' + firstYear + '_' + lastYear + '_m_yr'] =
+        overallEpr;
+
+
+      // --------------------------------------------------------
+      // SCE - shoreline change envelope across selected years
       // --------------------------------------------------------
 
       var allDistances =
-        ee.List([
-          d86,
-          d96,
-          d06,
-          d16,
-          d23,
-          d26
-        ]);
+        ee.List(
+          analysisYears.map(
+            function(y) {
+              return ee.Number(
+                feature.get('D_' + y)
+              );
+            }
+          )
+        );
 
 
       var maxDistance =
@@ -1443,14 +1220,12 @@ var results =
           )
         );
 
-
       var minDistance =
         ee.Number(
           allDistances.reduce(
             ee.Reducer.min()
           )
         );
-
 
       var sce =
         maxDistance.subtract(
@@ -1459,19 +1234,11 @@ var results =
 
 
       // --------------------------------------------------------
-      // LRR
+      // LRR - linear regression slope across selected years
       // --------------------------------------------------------
 
       var observationYears =
-        ee.List([
-          1986,
-          1996,
-          2006,
-          2016,
-          2023,
-          2026
-        ]);
-
+        ee.List(analysisYears);
 
       var meanYear =
         ee.Number(
@@ -1480,7 +1247,6 @@ var results =
           )
         );
 
-
       var meanDistance =
         ee.Number(
           allDistances.reduce(
@@ -1488,32 +1254,23 @@ var results =
           )
         );
 
-
       var numerator =
         ee.Number(
           ee.List.sequence(
             0,
-            5
+            analysisYears.length - 1
           ).map(
-            function(i) {
+            function(idx) {
 
               var x =
                 ee.Number(
-                  observationYears.get(i)
-                )
-                .subtract(
-                  meanYear
-                );
-
+                  observationYears.get(idx)
+                ).subtract(meanYear);
 
               var y =
                 ee.Number(
-                  allDistances.get(i)
-                )
-                .subtract(
-                  meanDistance
-                );
-
+                  allDistances.get(idx)
+                ).subtract(meanDistance);
 
               return x.multiply(y);
 
@@ -1523,23 +1280,18 @@ var results =
           )
         );
 
-
       var denominator =
         ee.Number(
           ee.List.sequence(
             0,
-            5
+            analysisYears.length - 1
           ).map(
-            function(i) {
+            function(idx) {
 
               var x =
                 ee.Number(
-                  observationYears.get(i)
-                )
-                .subtract(
-                  meanYear
-                );
-
+                  observationYears.get(idx)
+                ).subtract(meanYear);
 
               return x.pow(2);
 
@@ -1548,7 +1300,6 @@ var results =
             ee.Reducer.sum()
           )
         );
-
 
       var lrr =
         numerator.divide(
@@ -1563,13 +1314,13 @@ var results =
       var overall =
         ee.Algorithms.If(
 
-          nsm8626.lt(-10),
+          overallNsm.lt(-10),
 
           'Erosion',
 
           ee.Algorithms.If(
 
-            nsm8626.gt(10),
+            overallNsm.gt(10),
 
             'Accretion',
 
@@ -1587,25 +1338,25 @@ var results =
       var rateClass =
         ee.Algorithms.If(
 
-          epr8626.lt(-5),
+          overallEpr.lt(-5),
 
           'High erosion',
 
           ee.Algorithms.If(
 
-            epr8626.lt(-1),
+            overallEpr.lt(-1),
 
             'Moderate erosion',
 
             ee.Algorithms.If(
 
-              epr8626.lt(1),
+              overallEpr.lt(1),
 
               'Stable',
 
               ee.Algorithms.If(
 
-                epr8626.lt(5),
+                overallEpr.lt(5),
 
                 'Moderate accretion',
 
@@ -1620,78 +1371,35 @@ var results =
         );
 
 
-      return feature.set({
-
-        NSM_1986_1996_m:
-          nsm8696,
-
-        NSM_1996_2006_m:
-          nsm9606,
-
-        NSM_2006_2016_m:
-          nsm0616,
-
-        NSM_2016_2023_m:
-          nsm1623,
-
-        NSM_2023_2026_m:
-          nsm2326,
-
-        NSM_1986_2026_m:
-          nsm8626,
+      props.SCE_m = sce;
+      props.LRR_m_yr = lrr;
+      props.Overall_Change = overall;
+      props.Rate_Class = rateClass;
 
 
-        EPR_1986_1996_m_yr:
-          epr8696,
-
-        EPR_1996_2006_m_yr:
-          epr9606,
-
-        EPR_2006_2016_m_yr:
-          epr0616,
-
-        EPR_2016_2023_m_yr:
-          epr1623,
-
-        EPR_2023_2026_m_yr:
-          epr2326,
-
-        EPR_1986_2026_m_yr:
-          epr8626,
-
-
-        SCE_m:
-          sce,
-
-        LRR_m_yr:
-          lrr,
-
-        Overall_Change:
-          overall,
-
-        Rate_Class:
-          rateClass
-
-      });
+      return feature.set(props);
 
     }
   );
 
 
 // ============================================================================
-// 28. KEEP ONLY COMPLETE TRANSECTS
+// 24. KEEP ONLY TRANSECTS COMPLETE FOR THE SELECTED YEARS
 // ============================================================================
+
+var requiredFields =
+  analysisYears.map(
+    function(y) {
+      return 'D_' + y;
+    }
+  );
+
 
 var validResults =
   results.filter(
-    ee.Filter.notNull([
-      'D_1986',
-      'D_1996',
-      'D_2006',
-      'D_2016',
-      'D_2023',
-      'D_2026'
-    ])
+    ee.Filter.notNull(
+      requiredFields
+    )
   );
 
 
@@ -1701,6 +1409,11 @@ print(
 
 print(
   'TRANSECT RESULTS'
+);
+
+print(
+  'Analysis years:',
+  analysisYears
 );
 
 print(
@@ -1715,7 +1428,7 @@ print(
 
 
 // ============================================================================
-// 29. CLASSIFICATION
+// 25. CLASSIFICATION
 // ============================================================================
 
 var erosion =
@@ -1746,7 +1459,7 @@ var stable =
 
 
 // ============================================================================
-// 30. DISPLAY EROSION
+// 26. DISPLAY EROSION
 // ============================================================================
 
 Map.addLayer(
@@ -1755,13 +1468,13 @@ Map.addLayer(
     width: 3
   }),
   {},
-  'Erosion 1986-2026',
+  'Erosion ' + firstYear + '-' + lastYear,
   false
 );
 
 
 // ============================================================================
-// 31. DISPLAY ACCRETION
+// 27. DISPLAY ACCRETION
 // ============================================================================
 
 Map.addLayer(
@@ -1770,13 +1483,13 @@ Map.addLayer(
     width: 3
   }),
   {},
-  'Accretion 1986-2026',
+  'Accretion ' + firstYear + '-' + lastYear,
   false
 );
 
 
 // ============================================================================
-// 32. DISPLAY STABLE
+// 28. DISPLAY STABLE
 // ============================================================================
 
 Map.addLayer(
@@ -1785,13 +1498,13 @@ Map.addLayer(
     width: 2
   }),
   {},
-  'Stable 1986-2026',
+  'Stable ' + firstYear + '-' + lastYear,
   false
 );
 
 
 // ============================================================================
-// 33. PRINT CLASS COUNTS
+// 29. PRINT CLASS COUNTS
 // ============================================================================
 
 print(
@@ -1811,7 +1524,7 @@ print(
 
 
 // ============================================================================
-// 34. STATISTICS FUNCTION
+// 30. STATISTICS FUNCTION
 // ============================================================================
 
 function statistics(
@@ -1854,91 +1567,59 @@ function statistics(
 
 
 // ============================================================================
-// 35. OVERALL NSM STATISTICS
+// 31. OVERALL STATISTICS
 // ============================================================================
 
 statistics(
   validResults,
-  'NSM_1986_2026_m',
-  'NSM 1986-2026 statistics'
+  'NSM_' + firstYear + '_' + lastYear + '_m',
+  'NSM ' + firstYear + '-' + lastYear + ' statistics'
 );
-
-
-// ============================================================================
-// 36. OVERALL EPR STATISTICS
-// ============================================================================
 
 statistics(
   validResults,
-  'EPR_1986_2026_m_yr',
-  'EPR 1986-2026 statistics'
+  'EPR_' + firstYear + '_' + lastYear + '_m_yr',
+  'EPR ' + firstYear + '-' + lastYear + ' statistics'
 );
-
-
-// ============================================================================
-// 37. LRR STATISTICS
-// ============================================================================
 
 statistics(
   validResults,
   'LRR_m_yr',
-  'LRR 1986-2026 statistics'
+  'LRR ' + firstYear + '-' + lastYear + ' statistics'
 );
-
-
-// ============================================================================
-// 38. SCE STATISTICS
-// ============================================================================
 
 statistics(
   validResults,
   'SCE_m',
-  'SCE 1986-2026 statistics'
+  'SCE ' + firstYear + '-' + lastYear + ' statistics'
 );
 
 
 // ============================================================================
-// 39. PERIOD STATISTICS
+// 32. PER-PERIOD STATISTICS
 // ============================================================================
 
-statistics(
-  validResults,
-  'EPR_1986_1996_m_yr',
-  'EPR 1986-1996'
-);
+for (var m = 0; m < analysisYears.length - 1; m++) {
 
+  var periodYearA = analysisYears[m];
+  var periodYearB = analysisYears[m + 1];
 
-statistics(
-  validResults,
-  'EPR_1996_2006_m_yr',
-  'EPR 1996-2006'
-);
+  statistics(
+    validResults,
+    'EPR_' + periodYearA + '_' + periodYearB + '_m_yr',
+    'EPR ' + periodYearA + '-' + periodYearB
+  );
 
-
-statistics(
-  validResults,
-  'EPR_2006_2016_m_yr',
-  'EPR 2006-2016'
-);
-
-
-statistics(
-  validResults,
-  'EPR_2016_2023_m_yr',
-  'EPR 2016-2023'
-);
-
-
-statistics(
-  validResults,
-  'EPR_2023_2026_m_yr',
-  'EPR 2023-2026'
-);
+}
 
 
 // ============================================================================
-// 40. EXPORT COMPLETE RESULTS
+// 33. EXPORT COMPLETE RESULTS
 // ============================================================================
+
+var exportSuffix =
+  firstYear + '_' + lastYear;
+
 
 Export.table.toDrive({
 
@@ -1946,13 +1627,13 @@ Export.table.toDrive({
     validResults,
 
   description:
-    'Ilaje_Shoreline_Change_1986_2026',
+    'Ilaje_Shoreline_Change_' + exportSuffix,
 
   folder:
     'Ilaje_Shoreline_Analysis',
 
   fileNamePrefix:
-    'Ilaje_Shoreline_Change_1986_2026',
+    'Ilaje_Shoreline_Change_' + exportSuffix,
 
   fileFormat:
     'SHP'
@@ -1961,7 +1642,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 41. EXPORT CSV
+// 34. EXPORT CSV
 // ============================================================================
 
 Export.table.toDrive({
@@ -1970,13 +1651,13 @@ Export.table.toDrive({
     validResults,
 
   description:
-    'Ilaje_Shoreline_Change_1986_2026_CSV',
+    'Ilaje_Shoreline_Change_' + exportSuffix + '_CSV',
 
   folder:
     'Ilaje_Shoreline_Analysis',
 
   fileNamePrefix:
-    'Ilaje_Shoreline_Change_1986_2026',
+    'Ilaje_Shoreline_Change_' + exportSuffix,
 
   fileFormat:
     'CSV'
@@ -1985,7 +1666,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 42. EXPORT EROSION
+// 35. EXPORT EROSION
 // ============================================================================
 
 Export.table.toDrive({
@@ -1994,13 +1675,13 @@ Export.table.toDrive({
     erosion,
 
   description:
-    'Ilaje_Erosion_1986_2026',
+    'Ilaje_Erosion_' + exportSuffix,
 
   folder:
     'Ilaje_Shoreline_Analysis',
 
   fileNamePrefix:
-    'Ilaje_Erosion_1986_2026',
+    'Ilaje_Erosion_' + exportSuffix,
 
   fileFormat:
     'SHP'
@@ -2009,7 +1690,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 43. EXPORT ACCRETION
+// 36. EXPORT ACCRETION
 // ============================================================================
 
 Export.table.toDrive({
@@ -2018,13 +1699,13 @@ Export.table.toDrive({
     accretion,
 
   description:
-    'Ilaje_Accretion_1986_2026',
+    'Ilaje_Accretion_' + exportSuffix,
 
   folder:
     'Ilaje_Shoreline_Analysis',
 
   fileNamePrefix:
-    'Ilaje_Accretion_1986_2026',
+    'Ilaje_Accretion_' + exportSuffix,
 
   fileFormat:
     'SHP'
@@ -2033,7 +1714,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 44. EXPORT 2023 REFERENCE SHORELINE
+// 37. EXPORT 2023 REFERENCE SHORELINE
 // ============================================================================
 
 Export.table.toDrive({
@@ -2057,7 +1738,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 45. EXPORT TRANSECTS
+// 38. EXPORT TRANSECTS
 // ============================================================================
 
 Export.table.toDrive({
@@ -2081,7 +1762,7 @@ Export.table.toDrive({
 
 
 // ============================================================================
-// 46. END
+// 39. END
 // ============================================================================
 
 print(
@@ -2093,15 +1774,12 @@ print(
 );
 
 print(
-  'Reference year: 2023'
+  'Extracted years: ' + startYear + '-' + endYear + ' (every year)'
 );
 
 print(
-  'Historical years: 1986, 1996, 2006, 2016'
-);
-
-print(
-  'Current year: 2026'
+  'Analysis years (edit in section 1 after inspecting the map): ',
+  analysisYears
 );
 
 print(
