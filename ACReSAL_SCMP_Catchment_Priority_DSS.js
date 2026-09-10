@@ -20,6 +20,12 @@
  *       (e.g. '_p40') the way a multi-value percentile call does - the actual key was just
  *       'NDVI'. Reducer.setOutputs() now pins the key explicitly instead of guessing the
  *       naming convention, and .contains() checks existence without throwing.
+ *  V7 - decouples export resolution from the adaptive analysis SCALE: adds a fixed
+ *       EXPORT_SCALE = 100 m used by every GeoTIFF/Shapefile export (interactive and
+ *       Drive-queued, single model, clusters, and the six-model batch). reduceRegion() calls
+ *       that only compute stats/thresholds (classification breaks, hotspot cutoffs, area
+ *       sums) still use the adaptive SCALE for interactive speed - a quantile from a coarser
+ *       sample is statistically fine - only the pixels actually written to a file changed.
  *
  *  Changes vs the timeout-fixed version:
  *
@@ -82,7 +88,15 @@ var SCMP = ee.FeatureCollection('projects/ee-samuelcoolsdk/assets/SCMP_SHAPEFILE
 var NAME_FIELD = 'NAME';
 var START = '2018-01-01';
 var END   = '2026-01-01';
-var SCALE = 300;                                   // metres for the priority surface & stats - adaptive, see pickScale()
+var SCALE = 300;                                   // metres for reduceRegion stats/thresholds & map display - adaptive, see pickScale()
+var EXPORT_SCALE = 100;                             // metres for every exported GeoTIFF/Shapefile - fixed, NOT adaptive.
+// SCALE and EXPORT_SCALE are deliberately decoupled: percentile/threshold stats (classification
+// breaks, hotspot cutoffs, area sums) are read off a coarser adaptive-resolution sample for
+// interactive speed - a quantile from a 300-500 m sample is statistically fine - but every
+// pixel actually written to a GeoTIFF or vectorised into a Shapefile is evaluated at the fixed
+// 100 m output resolution. Note this doesn't add real information beyond the coarsest input's
+// native resolution (CHIRPS rainfall ~5.5 km, TerraClimate PET ~4.6 km, MODIS NDVI 250 m all
+// get resampled up to 100 m) - it standardises the OUTPUT grid, it doesn't sharpen the inputs.
 var PRIORITY_PALETTE = ['#1a9850','#91cf60','#fee08b','#fc8d59','#d73027']; // 5 classes: 1 (low) -> 5 (high)
 var PRIORITY_CLASS_LABELS = ['1 - Very Low', '2 - Low', '3 - Moderate', '4 - High', '5 - Very High'];
 var TS = 8;                                         // tileScale for heavy reduceRegion calls
@@ -673,7 +687,7 @@ var shpBtn       = ui.Button({label: 'Prepare priority-class Shapefile (interact
 var shpLabel     = ui.Label('', {fontSize: '11px', margin: '2px 8px 8px 8px', color: '#1a56cc'});
 var shpDriveBtn  = ui.Button({label: 'Or queue Shapefile as Drive export', style: {stretch: 'horizontal', margin: '0 8px 8px 8px'}, onClick: queueShapefileToDrive});
 var exportPanel  = ui.Panel([
-  ui.Label('Export (classes 1-5; run the analysis first)', {fontWeight: 'bold', fontSize: '12px', margin: '8px 8px 2px 8px'}),
+  ui.Label('Export (classes 1-5 at ' + EXPORT_SCALE + ' m; run the analysis first)', {fontWeight: 'bold', fontSize: '12px', margin: '8px 8px 2px 8px'}),
   geotiffBtn, geotiffLabel, geotiffDriveBtn,
   shpBtn, shpLabel, shpDriveBtn
 ]);
@@ -830,7 +844,7 @@ function runWithScale(sel) {
   resultsPanel.add(classLegend(modelName + ' priority class (1 low → 5 high)', PRIORITY_CLASS_LABELS, pal));
 
   // Per-model download buttons (GeoTIFF + Shapefile, both classified 1-5).
-  resultsPanel.add(ui.Label('Download this model (classes 1-5)', {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}));
+  resultsPanel.add(ui.Label('Download this model (classes 1-5 at ' + EXPORT_SCALE + ' m)', {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}));
   var tifB = ui.Button({label: 'GeoTIFF (interactive)', style: {stretch: 'horizontal', margin: '2px 8px'},
     onClick: exportModelGeoTIFF});
   var tifDriveB = ui.Button({label: 'Or queue GeoTIFF as Drive export', style: {stretch: 'horizontal', margin: '2px 8px'},
@@ -862,7 +876,7 @@ function exportModelGeoTIFF() {
   if (!current || !current.priorityClass) { status.setValue('Run a model first.'); return; }
   mTifLabel.setValue('Preparing GeoTIFF...'); mTifLabel.setUrl('');
   current.priorityClass.toInt().getDownloadURL({
-    name: modelFileName(current.model), scale: SCALE, region: current.region, crs: 'EPSG:4326',
+    name: modelFileName(current.model), scale: EXPORT_SCALE, region: current.region, crs: 'EPSG:4326',
     filePerBand: false, format: 'GEO_TIFF'
   }, function(url, err) {
     if (err) { mTifLabel.setValue('GeoTIFF error - try "queue as Drive export" instead: ' + err); return; }
@@ -875,16 +889,16 @@ function queueModelGeoTIFFToDrive() {
   Export.image.toDrive({
     image: current.priorityClass.toInt(),
     description: modelFileName(current.model),
-    scale: SCALE, region: current.region, crs: 'EPSG:4326', maxPixels: 1e10
+    scale: EXPORT_SCALE, region: current.region, crs: 'EPSG:4326', maxPixels: 1e10
   });
-  status.setValue('Queued "' + modelFileName(current.model) + '" - open the Tasks tab and click Run.');
+  status.setValue('Queued "' + modelFileName(current.model) + '" at ' + EXPORT_SCALE + ' m - open the Tasks tab and click Run.');
 }
 
 function exportModelShapefile() {
   if (!current || !current.priorityClass) { status.setValue('Run a model first.'); return; }
   mShpLabel.setValue('Vectorising priority classes...'); mShpLabel.setUrl('');
   var vec = current.priorityClass.toInt().reduceToVectors({
-    geometry: current.region, scale: SCALE, geometryType: 'polygon', eightConnected: true,
+    geometry: current.region, scale: EXPORT_SCALE, geometryType: 'polygon', eightConnected: true,
     labelProperty: 'priority_class', maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).map(function(f) { return f.set('model', current.model); });
   vec.getDownloadURL('SHP', ['priority_class', 'model'], modelFileName(current.model), function(url, err) {
@@ -902,7 +916,7 @@ function downloadAllModels() {
 }
 
 function queueAllModels(sel) {
-  status.setValue('Queuing six Drive export tasks (classes 1-5) at ' + SCALE + ' m...');
+  status.setValue('Queuing six Drive export tasks (classes 1-5) at ' + EXPORT_SCALE + ' m...');
   allPanel.clear();
   allPanel.add(ui.Label('Drive export tasks queued (open the Tasks tab and click Run on each)',
     {fontWeight: 'bold', fontSize: '12px', margin: '8px 8px 2px 8px', color: '#0b6623'}));
@@ -913,7 +927,7 @@ function queueAllModels(sel) {
     var desc = ('ACReSAL_' + mn + '_class1to5_' + sel.name).replace(/[^A-Za-z0-9]+/g, '_');
     Export.image.toDrive({
       image: cls, description: desc,
-      scale: SCALE, region: sel.region, crs: 'EPSG:4326', maxPixels: 1e10
+      scale: EXPORT_SCALE, region: sel.region, crs: 'EPSG:4326', maxPixels: 1e10
     });
     allPanel.add(ui.Label('✓ ' + mn + '  →  task "' + desc + '"',
       {fontSize: '11px', margin: '2px 8px'}));
@@ -967,7 +981,7 @@ function runClustersWithScale(sel) {
     areaLab.setValue(lines.join('\n'));
   });
 
-  clusterPanel.add(ui.Label('Export clusters', {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}));
+  clusterPanel.add(ui.Label('Export clusters (at ' + EXPORT_SCALE + ' m)', {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}));
   var cTifBtn = ui.Button({label: 'Prepare cluster GeoTIFF (interactive)', style: {stretch: 'horizontal', margin: '2px 8px'},
     onClick: exportClusterGeoTIFF});
   var cTifDriveBtn = ui.Button({label: 'Or queue cluster GeoTIFF as Drive export', style: {stretch: 'horizontal', margin: '2px 8px'},
@@ -987,7 +1001,7 @@ function exportClusterGeoTIFF() {
   cTifLabel.setValue('Preparing cluster GeoTIFF...'); cTifLabel.setUrl('');
   currentClusters.cls.toInt().getDownloadURL({
     name: 'ACReSAL_clusters_' + currentClusters.name,
-    scale: SCALE, region: currentClusters.region, crs: 'EPSG:4326',
+    scale: EXPORT_SCALE, region: currentClusters.region, crs: 'EPSG:4326',
     filePerBand: false, format: 'GEO_TIFF'
   }, function(url, err) {
     if (err) { cTifLabel.setValue('GeoTIFF error - try "queue as Drive export" instead: ' + err); return; }
@@ -1000,9 +1014,9 @@ function queueClusterGeoTIFFToDrive() {
   Export.image.toDrive({
     image: currentClusters.cls.toInt(),
     description: 'ACReSAL_clusters_' + currentClusters.name,
-    scale: SCALE, region: currentClusters.region, crs: 'EPSG:4326', maxPixels: 1e10
+    scale: EXPORT_SCALE, region: currentClusters.region, crs: 'EPSG:4326', maxPixels: 1e10
   });
-  status.setValue('Queued "ACReSAL_clusters_' + currentClusters.name + '" - open the Tasks tab and click Run.');
+  status.setValue('Queued "ACReSAL_clusters_' + currentClusters.name + '" at ' + EXPORT_SCALE + ' m - open the Tasks tab and click Run.');
 }
 
 function exportClusterShapefile() {
@@ -1011,7 +1025,7 @@ function exportClusterShapefile() {
   var vals   = CLUSTERS.map(function(c) { return c.v; });
   var labels = CLUSTERS.map(function(c) { return c.label; });
   var vec = currentClusters.cls.rename('cluster').toInt().reduceToVectors({
-    geometry: currentClusters.region, scale: SCALE, geometryType: 'polygon', eightConnected: true,
+    geometry: currentClusters.region, scale: EXPORT_SCALE, geometryType: 'polygon', eightConnected: true,
     labelProperty: 'cluster', maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).map(function(f) {
     var name = ee.List(labels).get(ee.List(vals).indexOf(f.getNumber('cluster')));
@@ -1030,7 +1044,7 @@ function exportGeoTIFF() {
   geotiffLabel.setValue('Preparing GeoTIFF link...'); geotiffLabel.setUrl('');
   current.priorityClass.toInt().getDownloadURL({
     name: 'ACReSAL_priority_class1to5_' + current.name,
-    scale: SCALE, region: current.region, crs: 'EPSG:4326',
+    scale: EXPORT_SCALE, region: current.region, crs: 'EPSG:4326',
     filePerBand: false, format: 'GEO_TIFF'
   }, function(url, err) {
     if (err) { geotiffLabel.setValue('GeoTIFF error - try "queue as Drive export" instead: ' + err); return; }
@@ -1043,16 +1057,16 @@ function queueGeoTIFFToDrive() {
   Export.image.toDrive({
     image: current.priorityClass.toInt(),
     description: 'ACReSAL_priority_class1to5_' + current.name,
-    scale: SCALE, region: current.region, crs: 'EPSG:4326', maxPixels: 1e10
+    scale: EXPORT_SCALE, region: current.region, crs: 'EPSG:4326', maxPixels: 1e10
   });
-  status.setValue('Queued "ACReSAL_priority_class1to5_' + current.name + '" - open the Tasks tab and click Run.');
+  status.setValue('Queued "ACReSAL_priority_class1to5_' + current.name + '" at ' + EXPORT_SCALE + ' m - open the Tasks tab and click Run.');
 }
 
 function exportShapefile() {
   if (!current || !current.priorityClass) { status.setValue('Run "Map priority areas" first.'); return; }
   shpLabel.setValue('Vectorising priority classes...'); shpLabel.setUrl('');
   var vec = current.priorityClass.toInt().reduceToVectors({
-    geometry: current.region, scale: SCALE, geometryType: 'polygon', eightConnected: true,
+    geometry: current.region, scale: EXPORT_SCALE, geometryType: 'polygon', eightConnected: true,
     labelProperty: 'priority_class', maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).map(function(f) { return f.set('model', current.model); });
   vec.getDownloadURL('SHP', ['priority_class', 'model'], 'ACReSAL_priority_class1to5_' + current.name, function(url, err) {
@@ -1064,13 +1078,13 @@ function exportShapefile() {
 function queueShapefileToDrive() {
   if (!current || !current.priorityClass) { status.setValue('Run "Map priority areas" first.'); return; }
   var vec = current.priorityClass.toInt().reduceToVectors({
-    geometry: current.region, scale: SCALE, geometryType: 'polygon', eightConnected: true,
+    geometry: current.region, scale: EXPORT_SCALE, geometryType: 'polygon', eightConnected: true,
     labelProperty: 'priority_class', maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).map(function(f) { return f.set('model', current.model); });
   Export.table.toDrive({
     collection: vec, description: 'ACReSAL_priority_class1to5_' + current.name, fileFormat: 'SHP'
   });
-  status.setValue('Queued "ACReSAL_priority_class1to5_' + current.name + '" - open the Tasks tab and click Run.');
+  status.setValue('Queued "ACReSAL_priority_class1to5_' + current.name + '" at ' + EXPORT_SCALE + ' m - open the Tasks tab and click Run.');
 }
 
 /* ============================ 5. CLICK -> PIXEL BREAKDOWN ============================ */
@@ -1123,9 +1137,9 @@ ui.root.add(ui.SplitPanel({firstPanel: controlPanel, secondPanel: ui.Panel(map),
  *  var cls = classifyPriority5(surface, region).toInt();
  *
  *  Export.image.toDrive({image: cls, description: 'ACReSAL_ErosionControl_class1to5_Misau_K_Gana',
- *                        region: region, scale: SCALE, crs: 'EPSG:4326', maxPixels: 1e10});
+ *                        region: region, scale: EXPORT_SCALE, crs: 'EPSG:4326', maxPixels: 1e10});
  *
- *  var vec = cls.reduceToVectors({geometry: region, scale: SCALE, geometryType: 'polygon',
+ *  var vec = cls.reduceToVectors({geometry: region, scale: EXPORT_SCALE, geometryType: 'polygon',
  *              eightConnected: true, labelProperty: 'priority_class', maxPixels: 1e10, tileScale: 8});
  *  Export.table.toDrive({collection: vec, description: 'ACReSAL_ErosionControl_class1to5_Misau_K_Gana_shp',
  *                        fileFormat: 'SHP'});
