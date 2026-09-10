@@ -2,6 +2,8 @@
  *  ACReSAL WITHIN-CATCHMENT PRIORITY DSS (SCMP)  -  Google Earth Engine
  *  ------------------------------------------------------------------------------------------
  *  V2 - adds agro-ecological / aridity-zone awareness and fixed 1-5 output classes.
+ *  V3 - adds a climate gate so flood/wetland priority can't be driven by terrain alone in
+ *       zones too dry to ever generate the runoff those terrain metrics assume.
  *
  *  Changes vs the timeout-fixed version:
  *
@@ -38,6 +40,19 @@
  *      and the "download all six models" batch. The intervention-cluster raster already used
  *      a 1-5 categorical scheme (a typology by theme precedence, not a priority ranking) and
  *      is left as-is.
+ *
+ *   C) CLIMATE GATE (Flood Mitigation / Wetland Restoration)
+ *      Problem: Flood Mitigation is 70% static terrain metrics (hand, drainageProx, upa, twi)
+ *      and only 12% rainfall. Terrain metrics answer "would this pixel be wet IF water showed
+ *      up", not "does enough water ever show up" - so a flat desert pediment next to a dry
+ *      wadi can score as flood-prone on terrain alone (near-zero slope makes TWI spike; being
+ *      next to any drainage line makes HAND low), even in a catchment's arid upper reaches
+ *      with almost no rainfall. A 12% rainfall weight can't override that.
+ *      Fix: climateGateFactor() multiplies the whole Flood Mitigation / Wetland Restoration
+ *      composite by a zone-dependent factor - near zero in hyper-arid/arid zones, full weight
+ *      once the zone is reliably wet enough to generate runoff (see CLIMATE_GATE). Deliberately
+ *      NOT applied to Erosion Control: semi-arid zones are classically the most erosion-prone
+ *      (sparse cover + intense convective storms), so gating erosion by aridity would be wrong.
  *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, capped fastDistanceTransform radius, simplified WDPA polygons, tileScale 8 on
@@ -287,6 +302,33 @@ var MODEL_NAMES = ['Flood Mitigation', 'Erosion Control', 'Reforestation', 'Irri
 // WITHIN each aridity zone rather than across the whole catchment (fix A.2).
 var ZONE_RELATIVE_CRITERIA = {ndvi: 1, ndviDeficit: 1, ndviDegrade: 1, ndviCond: 1};
 
+// FIX (A.4): CLIMATE GATE - Flood Mitigation and Wetland Restoration are dominated by static
+// terrain metrics (hand, twi, drainageProx, upa combine for 70% of the Flood Mitigation
+// weight). Those are proxies for "would this pixel be wet IF water showed up" - they say
+// nothing about whether enough rain ever arrives to generate that water. A flat desert
+// pediment next to a wadi can score as flood-prone on terrain alone (low HAND, spiking TWI
+// as slope -> 0) even though the wadi is dry most of the year. Rainfall is already one of the
+// weighted criteria, but at 10-14% of the AHP weight it can't override that. So after the
+// weighted overlay, multiply the whole composite by a zone-dependent factor - near zero in
+// hyper-arid/arid zones, full weight once rainfall is reliably sufficient to generate runoff -
+// instead of only nudging the linear weights. This is deliberately NOT applied to Erosion
+// Control: semi-arid zones are classically the MOST erosion-prone (sparse cover + intense
+// convective storms), so gating erosion priority by aridity would be scientifically backwards.
+var CLIMATE_GATE = {
+  //                     zone1  zone2  zone3  zone4  zone5
+  //              hyper-arid   arid  semi-arid  dry-subhumid  humid
+  'Flood Mitigation':    [0.05, 0.20, 0.55, 1.00, 1.00],
+  'Wetland Restoration': [0.05, 0.20, 0.55, 1.00, 1.00]
+};
+
+function climateGateFactor(modelName, aridityZone) {
+  var gate = CLIMATE_GATE[modelName];
+  if (!gate) { return null; }
+  var factor = ee.Image(1).toFloat();
+  [1, 2, 3, 4, 5].forEach(function(z, i) { factor = factor.where(aridityZone.eq(z), gate[i]); });
+  return factor;
+}
+
 // Single-population min-max stretch (0-1), applying direction. If the layer is flat
 // (lo == hi) it contributes 0 everywhere, avoiding unitScale(0,0) errors.
 function standardiseSingle(img, region, dir) {
@@ -327,6 +369,8 @@ function buildModel(modelName, region, layers) {
     acc = acc.add(standardise(raw, region, cr.d, zoneImg).multiply(cr.w));
   });
   var surface = acc.multiply(100).rename('priority').clip(region);
+  var gate = climateGateFactor(modelName, layers.aridityZone);
+  if (gate) { surface = surface.multiply(gate).rename('priority'); }
   if (modelName === 'Wetland Restoration') {
     var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
     var exclude = wc.eq(80).or(wc.eq(50));   // permanent water & built-up
@@ -534,6 +578,11 @@ function showModelCriteria() {
     modelInfo.add(ui.Label('• ' + cr.c + '  —  ' + cr.w.toFixed(2) + '  (' + dir + zoneTag + ')',
       {fontSize: '10.5px', margin: '1px 4px', color: '#444'}));
   });
+  if (CLIMATE_GATE[modelSelect.getValue()]) {
+    modelInfo.add(ui.Label('⚠ climate-gated: composite score is scaled down in hyper-arid/arid zones ' +
+      '(terrain alone can’t flag flood/wetland priority where there isn’t enough rain to generate it)',
+      {fontSize: '10px', margin: '4px 4px 2px 4px', color: '#a15c00', fontStyle: 'italic'}));
+  }
 }
 modelSelect.onChange(showModelCriteria);
 showModelCriteria();
