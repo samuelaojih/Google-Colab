@@ -7,6 +7,14 @@
  *  V4 - fixes 'projects/sat-io/open-datasets/GRIP4/density', which is not a real EE asset
  *       (GEE: "Image asset ... not found"). roadAccess is now built from the actual GRIP4
  *       vector road network (see criterionLayers()).
+ *  V5 - fixes "Too many concurrent aggregations": the V2 zonal-standardisation fix called
+ *       reduceRegion() once per criterion PER ZONE, and Earth Engine re-runs every
+ *       reduceRegion() baked into a displayed image once per map tile (tiles render in
+ *       parallel) - a model with several zone-relative criteria (e.g. Agricultural
+ *       Productivity) could fire ~19 aggregation calls in a burst. buildModel() and the
+ *       reforestation theme's zone threshold now fetch all their stats via ONE combined
+ *       reduceRegion (global criteria) and ONE combined grouped-by-zone reduceRegion (zone-
+ *       relative criteria), regardless of how many criteria are involved.
  *
  *  Changes vs the timeout-fixed version:
  *
@@ -25,7 +33,7 @@
  *           catchment automatically shows its true ecozone split. Added as its own map layer
  *           + legend (classifyAridityZone / criterionLayers().aridityZone).
  *        2. Vegetation-cover criteria (ndvi, ndviDeficit, ndviDegrade, ndviCond) are now
- *           standardised WITHIN each aridity zone separately (standardise(..., zoneImg)),
+ *           standardised WITHIN each aridity zone separately (see buildModel()'s zoneCr path),
  *           so "sparse vegetation" is judged against what is normal for that pixel's own
  *           ecozone, not against the whole catchment.
  *        3. The Reforestation cluster theme's "sparse vegetation" test no longer uses a flat
@@ -344,45 +352,76 @@ function climateGateFactor(modelName, aridityZone) {
   return factor;
 }
 
-// Single-population min-max stretch (0-1), applying direction. If the layer is flat
-// (lo == hi) it contributes 0 everywhere, avoiding unitScale(0,0) errors.
-function standardiseSingle(img, region, dir) {
-  var mm = img.reduceRegion({reducer: ee.Reducer.percentile([2, 98]), geometry: region,
-    scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS});
-  var keys = mm.keys();
-  var lo = ee.Number(ee.Algorithms.If(mm.get(keys.get(0)), mm.get(keys.get(0)), 0));
-  var hi = ee.Number(ee.Algorithms.If(mm.get(keys.get(1)), mm.get(keys.get(1)), 0));
+// FIX (concurrent-aggregations): applies a 0-1 min-max stretch given ALREADY-COMPUTED lo/hi
+// bounds. This is deliberately split from "how lo/hi get computed" (see buildModel() below) -
+// the earlier version called reduceRegion() once PER CRITERION, and once per criterion PER
+// ZONE for zone-relative criteria. Earth Engine re-runs every reduceRegion() baked into a
+// displayed image once for EACH map tile it renders, and tiles render in parallel, so a model
+// with several zone-relative criteria (e.g. Agricultural Productivity: both 'ndvi' and
+// 'ndviCond') could fire ~19 aggregation calls in a burst and hit the account's concurrent-
+// aggregation quota ("Too many concurrent aggregations"). buildModel() now fetches lo/hi for
+// ALL of a model's criteria in at most 2 reduceRegion calls total (one combined multi-band
+// call for the ordinary criteria, one combined grouped-by-zone call for the zone-relative
+// ones) and this helper just applies the stretch each criterion's band already has.
+function applyStretch(band, dir, lo, hi) {
   var flat = hi.subtract(lo).abs().lt(1e-9);
   var hiSafe = ee.Number(ee.Algorithms.If(flat, lo.add(1), hi));   // keep unitScale valid
-  var s = img.unitScale(lo, hiSafe).clamp(0, 1);
+  var s = band.unitScale(lo, hiSafe).clamp(0, 1);
   s = (dir === '-') ? s.multiply(-1).add(1) : s;
   return ee.Image(ee.Algorithms.If(flat, ee.Image(0), s)).toFloat();   // flat -> 0 contribution
-}
-
-// FIX (A.2): when zoneImg is supplied, min-max stretch is computed SEPARATELY within each of
-// the 5 aridity zones and recombined, so a pixel's "low/high" is judged against its own
-// ecozone rather than the whole catchment (e.g. NDVI in the Sahel/Arid part of a catchment is
-// judged against other Sahel/Arid pixels, not against the wetter Hadejia-plains tail).
-function standardise(img, region, dir, zoneImg) {
-  if (!zoneImg) { return standardiseSingle(img, region, dir); }
-  var out = ee.Image(0).toFloat();
-  [1, 2, 3, 4, 5].forEach(function(z) {
-    var mask = zoneImg.eq(z);
-    var s = standardiseSingle(img.updateMask(mask), region, dir);
-    out = out.where(mask, s.unmask(out));   // keep prior value where this zone has no data
-  });
-  return out.updateMask(img.mask()).toFloat();
 }
 
 // Build one intervention's 0-100 suitability surface (weighted linear combination).
 function buildModel(modelName, region, layers) {
   var m = MODELS[modelName];
   var acc = ee.Image(0);
-  m.criteria.forEach(function(cr) {
-    var raw = layers[cr.c].rename('v').toFloat();
-    var zoneImg = ZONE_RELATIVE_CRITERIA[cr.c] ? layers.aridityZone : null;
-    acc = acc.add(standardise(raw, region, cr.d, zoneImg).multiply(cr.w));
-  });
+
+  var globalCr = m.criteria.filter(function(cr) { return !ZONE_RELATIVE_CRITERIA[cr.c]; });
+  var zoneCr   = m.criteria.filter(function(cr) { return  ZONE_RELATIVE_CRITERIA[cr.c]; });
+
+  // Ordinary criteria: ONE combined reduceRegion (2nd/98th percentile per band) for all of
+  // them at once, same pattern the legacy buildPriority() already used further up this file.
+  if (globalCr.length > 0) {
+    var globalImg = ee.Image.cat(globalCr.map(function(cr) { return layers[cr.c].rename(cr.c).toFloat(); }));
+    var globalPct = globalImg.reduceRegion({reducer: ee.Reducer.percentile([2, 98]), geometry: region,
+      scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS});
+    globalCr.forEach(function(cr) {
+      var band = layers[cr.c].rename(cr.c).toFloat();
+      var lo = ee.Number(ee.Algorithms.If(globalPct.get(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
+      var hi = ee.Number(ee.Algorithms.If(globalPct.get(cr.c + '_p98'), globalPct.get(cr.c + '_p98'), 0));
+      acc = acc.add(applyStretch(band, cr.d, lo, hi).multiply(cr.w));
+    });
+  }
+
+  // Zone-relative criteria (fix A.2: standardised WITHIN each aridity zone, not catchment-
+  // wide): ONE combined, grouped-by-zone reduceRegion for all of them at once, instead of one
+  // call per criterion per zone. ee.Reducer.percentile([2,98]).group() returns per-zone stats
+  // for every band in a single pass (same 'groups' pattern already used for area-by-cluster
+  // and area-by-class elsewhere in this script), then a server-side .iterate() recombines the
+  // per-zone stretch into one image without any extra reduceRegion calls.
+  if (zoneCr.length > 0) {
+    var zoneImgMulti = ee.Image.cat(zoneCr.map(function(cr) { return layers[cr.c].rename(cr.c).toFloat(); }))
+                          .addBands(layers.aridityZone.rename('zone'));
+    var zoneGroups = ee.List(zoneImgMulti.reduceRegion({
+      reducer: ee.Reducer.percentile([2, 98]).group({groupField: zoneCr.length, groupName: 'zone'}),
+      geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+    }).get('groups'));
+
+    zoneCr.forEach(function(cr) {
+      var band = layers[cr.c].rename(cr.c).toFloat();
+      var stretched = ee.Image(zoneGroups.iterate(function(g, prevImg) {
+        g = ee.Dictionary(g);
+        var z = ee.Number(g.get('zone'));
+        var lo = ee.Number(ee.Algorithms.If(g.get(cr.c + '_p2'), g.get(cr.c + '_p2'), 0));
+        var hi = ee.Number(ee.Algorithms.If(g.get(cr.c + '_p98'), g.get(cr.c + '_p98'), 0));
+        var s = applyStretch(band, cr.d, lo, hi);
+        var mask = layers.aridityZone.eq(z);
+        return ee.Image(prevImg).where(mask, s.unmask(ee.Image(prevImg)));
+      }, ee.Image(0).toFloat()));
+      acc = acc.add(ee.Image(stretched).updateMask(band.mask()).multiply(cr.w));
+    });
+  }
+
   var surface = acc.multiply(100).rename('priority').clip(region);
   var gate = climateGateFactor(modelName, layers.aridityZone);
   if (gate) { surface = surface.multiply(gate).rename('priority'); }
@@ -475,23 +514,23 @@ function buildThemes(region) {
   // cutoff (which over-flags a naturally sparse Sahel/Arid zone and can miss real degradation
   // in a wetter sub-zone). Instead use the 40th NDVI percentile computed SEPARATELY within
   // each fixed aridity zone, so the threshold adapts to what "sparse" means in that ecozone.
+  // FIX (concurrent-aggregations): this used to call reduceRegion() twice per zone (10 calls
+  // total) in a JS loop - one combined, grouped-by-zone reduceRegion (see buildModel() for why
+  // that matters: every reduceRegion() baked into a displayed image re-runs per map tile).
   var pet = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE').filterDate(START, END)
               .filterBounds(region).select('pet').mean().multiply(0.1).multiply(12);
   var aridityZone = classifyAridityZone(precip.divide(pet.max(1)));
-  var ndviSparse = ee.Image(0).toByte();
-  [1, 2, 3, 4, 5].forEach(function(z) {
-    var zoneMask = aridityZone.eq(z);
-    var zoneThr = ee.Number(ee.Algorithms.If(
-      ndviMean.updateMask(zoneMask).reduceRegion({
-        reducer: ee.Reducer.percentile([40]), geometry: region, scale: SCALE,
-        maxPixels: 1e10, bestEffort: true, tileScale: TS
-      }).get('NDVI_p40'),
-      ndviMean.updateMask(zoneMask).reduceRegion({
-        reducer: ee.Reducer.percentile([40]), geometry: region, scale: SCALE,
-        maxPixels: 1e10, bestEffort: true, tileScale: TS
-      }).get('NDVI_p40'), 0.5));
-    ndviSparse = ndviSparse.where(zoneMask, ndviMean.lt(zoneThr));
-  });
+  var ndviZoneGroups = ee.List(ndviMean.addBands(aridityZone.rename('zone')).reduceRegion({
+    reducer: ee.Reducer.percentile([40]).group({groupField: 1, groupName: 'zone'}),
+    geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+  }).get('groups'));
+  var ndviSparse = ee.Image(ndviZoneGroups.iterate(function(g, prevImg) {
+    g = ee.Dictionary(g);
+    var z = ee.Number(g.get('zone'));
+    var thr = ee.Number(ee.Algorithms.If(g.get('NDVI_p40'), g.get('NDVI_p40'), 0.5));
+    var mask = aridityZone.eq(z);
+    return ee.Image(prevImg).where(mask, ndviMean.lt(thr));
+  }, ee.Image(0).toByte()));
   var reforest = wc.eq(20).or(wc.eq(30)).or(wc.eq(60)).and(ndviSparse);
 
   var wdpaFC = ee.FeatureCollection('WCMC/WDPA/current/polygons')
