@@ -4,6 +4,9 @@
  *  V2 - adds agro-ecological / aridity-zone awareness and fixed 1-5 output classes.
  *  V3 - adds a climate gate so flood/wetland priority can't be driven by terrain alone in
  *       zones too dry to ever generate the runoff those terrain metrics assume.
+ *  V4 - fixes 'projects/sat-io/open-datasets/GRIP4/density', which is not a real EE asset
+ *       (GEE: "Image asset ... not found"). roadAccess is now built from the actual GRIP4
+ *       vector road network (see criterionLayers()).
  *
  *  Changes vs the timeout-fixed version:
  *
@@ -239,9 +242,21 @@ function criterionLayers(region) {
   var pop = ee.ImageCollection('projects/sat-io/open-datasets/hrsl/hrslpop')
               .filterBounds(region).mosaic().unmask(0).add(1).log().rename('pop');
 
-  // Road access (OSM not native -> GRIP global roads density as accessibility proxy)
-  var roadAccess = ee.Image('projects/sat-io/open-datasets/GRIP4/density')
-                     .unmask(0).rename('roadAccess');
+  // Road access (OSM not native -> GRIP4 roads as accessibility proxy).
+  // FIX: 'projects/sat-io/open-datasets/GRIP4/density' is not a real asset - it does not
+  // exist in the sat-io catalog and GEE returned "Image asset ... not found". GRIP4 in
+  // sat-io is a VECTOR road network split by continent (FeatureCollection), not a pre-baked
+  // density raster; Nigeria falls under the 'Africa' region asset. Build the same kind of
+  // accessibility proxy from the lines directly: distance to nearest road, inverted so
+  // "higher roadAccess = closer to a road" (matches the '+' direction used for roadAccess in
+  // the AHP models below), with the search radius capped at 500 px - the same
+  // fastDistanceTransform() pattern already used for drainageProx, for the same reason
+  // (an uncapped search radius over a large catchment is a common cause of timeouts).
+  var roadsFC = ee.FeatureCollection('projects/sat-io/open-datasets/GRIP4/Africa').filterBounds(region);
+  var roadPixels = ee.Image().byte().paint(roadsFC, 1).unmask(0);
+  var roadDist = roadPixels.not().fastDistanceTransform(500, 'pixels').sqrt()
+                   .multiply(ee.Image.pixelArea().sqrt());
+  var roadAccess = roadDist.multiply(-1).rename('roadAccess');   // closer to a road -> higher value
 
   // Derived pressure / condition layers
   var ecoPressure  = built.focalMean(1000, 'circle', 'meters')
