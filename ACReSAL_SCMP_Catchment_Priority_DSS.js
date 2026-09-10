@@ -15,6 +15,11 @@
  *       reforestation theme's zone threshold now fetch all their stats via ONE combined
  *       reduceRegion (global criteria) and ONE combined grouped-by-zone reduceRegion (zone-
  *       relative criteria), regardless of how many criteria are involved.
+ *  V6 - fixes "Dictionary does not contain key: 'NDVI_p40'" in the reforestation cluster
+ *       theme: a reducer given a SINGLE percentile value does not suffix its output key
+ *       (e.g. '_p40') the way a multi-value percentile call does - the actual key was just
+ *       'NDVI'. Reducer.setOutputs() now pins the key explicitly instead of guessing the
+ *       naming convention, and .contains() checks existence without throwing.
  *
  *  Changes vs the timeout-fixed version:
  *
@@ -387,8 +392,8 @@ function buildModel(modelName, region, layers) {
       scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS});
     globalCr.forEach(function(cr) {
       var band = layers[cr.c].rename(cr.c).toFloat();
-      var lo = ee.Number(ee.Algorithms.If(globalPct.get(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
-      var hi = ee.Number(ee.Algorithms.If(globalPct.get(cr.c + '_p98'), globalPct.get(cr.c + '_p98'), 0));
+      var lo = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
+      var hi = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p98'), globalPct.get(cr.c + '_p98'), 0));
       acc = acc.add(applyStretch(band, cr.d, lo, hi).multiply(cr.w));
     });
   }
@@ -412,8 +417,8 @@ function buildModel(modelName, region, layers) {
       var stretched = ee.Image(zoneGroups.iterate(function(g, prevImg) {
         g = ee.Dictionary(g);
         var z = ee.Number(g.get('zone'));
-        var lo = ee.Number(ee.Algorithms.If(g.get(cr.c + '_p2'), g.get(cr.c + '_p2'), 0));
-        var hi = ee.Number(ee.Algorithms.If(g.get(cr.c + '_p98'), g.get(cr.c + '_p98'), 0));
+        var lo = ee.Number(ee.Algorithms.If(g.contains(cr.c + '_p2'), g.get(cr.c + '_p2'), 0));
+        var hi = ee.Number(ee.Algorithms.If(g.contains(cr.c + '_p98'), g.get(cr.c + '_p98'), 0));
         var s = applyStretch(band, cr.d, lo, hi);
         var mask = layers.aridityZone.eq(z);
         return ee.Image(prevImg).where(mask, s.unmask(ee.Image(prevImg)));
@@ -520,14 +525,20 @@ function buildThemes(region) {
   var pet = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE').filterDate(START, END)
               .filterBounds(region).select('pet').mean().multiply(0.1).multiply(12);
   var aridityZone = classifyAridityZone(precip.divide(pet.max(1)));
+  // FIX (missing-key): a reducer given a SINGLE percentile value does not suffix its output
+  // key with '_p40' the way a multi-value percentile.group() call does elsewhere in this
+  // script (that suffix only appears to disambiguate multiple outputs) - the key here was
+  // actually just 'NDVI', so a hardcoded '_p40' guess threw "Dictionary does not contain key".
+  // .setOutputs() pins the key explicitly instead of relying on that naming convention, and
+  // .contains() checks existence without throwing (unlike calling .get() on a missing key).
   var ndviZoneGroups = ee.List(ndviMean.addBands(aridityZone.rename('zone')).reduceRegion({
-    reducer: ee.Reducer.percentile([40]).group({groupField: 1, groupName: 'zone'}),
+    reducer: ee.Reducer.percentile([40]).setOutputs(['ndviP40']).group({groupField: 1, groupName: 'zone'}),
     geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).get('groups'));
   var ndviSparse = ee.Image(ndviZoneGroups.iterate(function(g, prevImg) {
     g = ee.Dictionary(g);
     var z = ee.Number(g.get('zone'));
-    var thr = ee.Number(ee.Algorithms.If(g.get('NDVI_p40'), g.get('NDVI_p40'), 0.5));
+    var thr = ee.Number(ee.Algorithms.If(g.contains('ndviP40'), g.get('ndviP40'), 0.5));
     var mask = aridityZone.eq(z);
     return ee.Image(prevImg).where(mask, ndviMean.lt(thr));
   }, ee.Image(0).toByte()));
