@@ -72,6 +72,46 @@ there is essentially no rainfall to ever generate that runoff. Erosion Control i
 deliberately not gated this way - semi-arid zones are classically the most
 erosion-prone (sparse cover + intense convective storms).
 
+## Analysis add-ons
+
+- **Shared exclusion mask.** No model recommends siting on built-up land or open
+  permanent water; Agricultural Productivity and Irrigation additionally exclude WDPA
+  protected areas (the restoration-oriented models deliberately don't - intervening in
+  or around a protected area is often the point). `EXISTING_INTERVENTIONS_ASSET` is an
+  empty-by-default hook for your own "already funded/treated" FeatureCollection, if you
+  have one.
+- **Minimum mapping unit.** Classified rasters (priority classes and intervention
+  clusters) are sieved with a 1 ha minimum patch size (`MIN_PATCH_HA`) before being
+  shown, vectorized, or exported, so outputs aren't salt-and-pepper noise at 50-100 m.
+- **Pairwise AHP weight editor.** "⚖ Adjust AHP weights" lets you re-derive a model's
+  weights from Saaty 1-9 pairwise judgments instead of the built-in defaults, and
+  reports the Consistency Ratio (CR) - the standard AHP check; CR < 0.10 is considered
+  acceptable. "Reset to default weights" restores the originals.
+- **Monte Carlo weight-sensitivity analysis.** After running a model, "Run
+  weight-sensitivity analysis" perturbs its weights ±20% across 24 draws and shows
+  per-pixel score variability and "class-5 stability" (how often a pixel stayed "very
+  high priority" across draws) - low-stability areas are borderline calls sensitive to
+  the exact weights used.
+- **Candidate site points.** Centroids of class-5 patches ≥ 5 ha (`SITE_MIN_AREA_HA`),
+  exportable as a point Shapefile - more directly actionable for a field team than a
+  raw priority-class mask.
+- **Two-period change detection.** "Compare periods" re-runs a model over two date
+  windows and diffs the classified rasters (-4..+4) to show where priority is trending
+  up (growing need) vs down (improving / already addressed).
+- **Exploratory CMIP6 signal.** An optional, off-by-default map layer comparing
+  projected SSP2-4.5 rainfall (2030-2050, a 4-model ensemble) against the CMIP6
+  historical baseline (1995-2014). Deliberately not wired into any model's weights - a
+  coarse "wetter or drier" flag, not a validated criterion (NEX-GDDP-CMIP6 has no PET
+  band, so it isn't a true future aridity index).
+- **Burned-area frequency.** MODIS MCD64A1 burned-area frequency is now a criterion in
+  Erosion Control and Reforestation (repeated burning strips cover and signals land
+  needing reforestation).
+- **Not implemented (no verifiable public GEE asset)**: livestock/grazing-pressure
+  density and land-tenure/conflict-risk layers. Both are real, relevant drivers for
+  this region - wire them in the same way as burned-area frequency if/when you have a
+  specific, verified asset ID (e.g. a licensed livestock-density raster, or a
+  project-specific conflict-risk layer).
+
 ## Adapting it
 
 - To change AHP weights or add/remove criteria, edit `MODELS` and add the new layer to
@@ -80,6 +120,11 @@ erosion-prone (sparse cover + intense convective storms).
 - To point at a different country/region, swap `GAUL1`/`GAUL2` filters and the aridity/
   elevation breakpoints (`classifyAridityZone`/`classifyElevationZone`) if the region's
   ecology doesn't match Nigeria's.
+- `buildModel()` is a thin wrapper over `buildNormalizedCriteria()` (the expensive,
+  reduceRegion-based standardisation step) and `weightedComposite()` (cheap band math);
+  anything that needs to re-score a model with different weights without repeating the
+  standardisation step (as the sensitivity analysis does) should call those two
+  directly rather than `buildModel()`.
 - `buildCriteria()`/`buildPriority()`/`CRITERIA` (section 1/2) are an older, simpler
   slider-driven weighted-overlay example kept for reference - not wired to any UI and
   not updated with the Sentinel-2/ecozone/resolution changes above.

@@ -108,6 +108,72 @@
  *       independent of the fine SCALE used for the priority surface, its classification, and
  *       every export (GeoTIFF/Shapefile), which are untouched by this fix.
  *
+ *  V9 - adds sensitivity analysis, a shared exclusion mask, a minimum-mapping-unit filter, a
+ *       pairwise-AHP weight editor, a new criterion, candidate site points, two-period change
+ *       detection, and an exploratory future-climate signal. In order:
+ *
+ *   H) SHARED EXCLUSION MASK - exclusionMask(). No model should ever recommend built-up land or
+ *      open permanent water; Agricultural Productivity/Irrigation additionally exclude WDPA
+ *      protected areas. Applied inside weightedComposite() for all six models (replaces the old
+ *      Wetland-Restoration-only exclusion). EXISTING_INTERVENTIONS_ASSET is a documented, empty-
+ *      by-default hook for a user's own "already treated" FeatureCollection, if they have one.
+ *
+ *   I) buildModel() SPLIT INTO buildNormalizedCriteria() + weightedComposite() - the expensive
+ *      stretch-bound reduceRegion calls now happen once and produce a reusable multiband 0-1
+ *      image; the actual weighted sum is cheap band math that can be re-run against many
+ *      different weight sets (Monte Carlo draws, live AHP edits) without repeating the
+ *      reduceRegion calls. buildModel() is now a thin wrapper of the two for callers that don't
+ *      need to reuse the normalized bands.
+ *
+ *   M) MINIMUM MAPPING UNIT / SIEVE FILTER - applyMinMappingUnit(), applied inside
+ *      classifyPriority5() and buildClusters(). A pixel-by-pixel classification at 50-100 m
+ *      produces salt-and-pepper noise; patches smaller than MIN_PATCH_HA are merged into their
+ *      neighbourhood's majority (focal-mode) class before the raster is shown, vectorized, or
+ *      exported - the same idea as GDAL's sieve filter.
+ *
+ *   E) PAIRWISE AHP WEIGHT EDITOR + CONSISTENCY RATIO - the "Adjust AHP weights" panel (section
+ *      3) lets a user re-derive a model's weights from Saaty 1-9 pairwise judgments instead of
+ *      the asserted defaults, and reports the Consistency Ratio (CR) - CR < 0.10 is the standard
+ *      AHP acceptability threshold. Uses the standard closed-form eigenvector approximation
+ *      (normalise columns, average rows), appropriate for these small (n<=9) matrices.
+ *      "Reset to default weights" restores the built-in values (DEFAULT_MODEL_WEIGHTS).
+ *
+ *   NEW CRITERION - burnFreq (MODIS MCD64A1 burned-area frequency, months burned during the
+ *      analysis window) added to Erosion Control and Reforestation, whose other weights were
+ *      rescaled to still sum to 1.00. Repeated burning is both an erosion driver (strips cover
+ *      ahead of the rains) and a direct signal of land needing reforestation.
+ *
+ *   N) MONTE CARLO WEIGHT-SENSITIVITY ANALYSIS - runSensitivityAnalysis(), a button shown after
+ *      running a model. Perturbs each criterion weight +/-20% across 24 draws (reusing the SAME
+ *      normalized criteria bands - no repeated reduceRegion calls) and shows (a) per-pixel score
+ *      std-dev and (b) the fraction of draws where a pixel stayed "class 5" - low class-5
+ *      stability flags borderline calls that are sensitive to the exact AHP weights used, which
+ *      is the standard MCDA robustness check this script previously had no way to show.
+ *
+ *   J) CANDIDATE SITE POINTS - candidateSitePoints(), exported alongside the raster/polygon
+ *      outputs. Centroids of class-5 patches at least SITE_MIN_AREA_HA in size - more directly
+ *      actionable for a field team than a raw priority-class mask.
+ *
+ *   K) TWO-PERIOD COMPARISON / CHANGE DETECTION - "Compare periods" (section 3/4). Re-runs a
+ *      model over two different date windows (buildForPeriod(), which safely swaps START/END
+ *      only for the duration of building that period's expression graph) and diffs the
+ *      classified rasters (-4..+4) to show where priority is trending up vs down over time -
+ *      the M&E use case this script previously had no way to answer.
+ *
+ *   L) EXPLORATORY CMIP6 FUTURE-RAINFALL SIGNAL - cmip6RainfallChange(), an optional, off-by-
+ *      default map layer comparing NEX-GDDP-CMIP6 SSP2-4.5 projected rainfall (2030-2050, a
+ *      4-model ensemble mean) against the CMIP6 historical baseline (1995-2014). Deliberately
+ *      NOT wired into any model's weights - it is a coarse, exploratory "wetter or drier"
+ *      signal (no PET data in this collection, so it is not a true future aridity index), shown
+ *      only so a user can sanity-check whether a catchment's siting decisions might need
+ *      revisiting under a warmer/wetter-or-drier future, not to silently change today's scores.
+ *
+ *   SKIPPED (no verifiable public Earth Engine asset, to avoid repeating the V4 bad-asset
+ *   mistake): livestock/grazing-pressure density and land-tenure/conflict-risk layers. Both are
+ *   real, relevant degradation/siting-risk drivers for this region - wire them in the same way
+ *   as burnFreq above if/when a specific, verified asset ID is available (e.g. a licensed
+ *   livestock density raster or a project-specific conflict-risk layer).
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
@@ -409,6 +475,16 @@ function criterionLayers(region) {
   var ecoCondition = ndvi.rename('ecoCondition');
   var builtPressure = built.focalMean(1000, 'circle', 'meters').rename('builtPressure');
 
+  // Burned-area frequency (MODIS MCD64A1, monthly, 500 m native) - a fire regime is a real
+  // degradation driver in the savannah/Sahel-transition belt (repeated burning strips cover
+  // and accelerates erosion, and is itself a signal of land needing reforestation). Counts the
+  // number of months with a mapped burn during the analysis window; bilinearly resampled since
+  // it is coarser than the output grid and, once aggregated into a count, behaves as a smooth
+  // density-like field rather than the per-pixel categorical burn date it started as.
+  var burnFreq = ee.ImageCollection('MODIS/061/MCD64A1').filterDate(START, END).filterBounds(region)
+                   .select('BurnDate').map(function(img) { return img.gt(0); }).sum()
+                   .resample('bilinear').rename('burnFreq');
+
   return {
     hand: hand, drainageProx: drainageProx, upa: upa, twi: twi, rainfall: precip,
     pop: pop, built: built, slope: slope, kfactor: kfactor, drainageDensity: drainageDensity,
@@ -416,7 +492,7 @@ function criterionLayers(region) {
     ndviDeficit: ndviDeficit, natvegDeficit: natvegDeficit, ecoRestore: ecoRestore,
     soc: soc, roadAccess: roadAccess, awc: awc, ndvi: ndvi, ndviCond: ndviCond,
     ph: ph, cropland: cropland, ndwi: ndwi, permWater: permWater,
-    ecoCondition: ecoCondition, wetlandSignal: wetlandSignal,
+    ecoCondition: ecoCondition, wetlandSignal: wetlandSignal, burnFreq: burnFreq,
     aridityIdx: aridityIdx, aridityZone: aridityZone,
     elevationZone: elevationZone, ecoZone: ecoZone
   };
@@ -429,15 +505,18 @@ var MODELS = {
     {c: 'twi', w: 0.14, d: '+'}, {c: 'rainfall', w: 0.12, d: '+'}, {c: 'pop', w: 0.10, d: '+'},
     {c: 'built', w: 0.08, d: '+'}
   ]},
+  // V9: burnFreq (MODIS MCD64A1 burned-area frequency) added as a degradation-driver criterion;
+  // other weights rescaled so the model still sums to 1.00.
   'Erosion Control': { palette: ['#ffffcc','#fed976','#fd8d3c','#e31a1c','#800026'], criteria: [
-    {c: 'slope', w: 0.25, d: '+'}, {c: 'kfactor', w: 0.20, d: '+'}, {c: 'rainfall', w: 0.18, d: '+'},
-    {c: 'drainageDensity', w: 0.15, d: '+'}, {c: 'ndviDegrade', w: 0.12, d: '+'},
+    {c: 'slope', w: 0.23, d: '+'}, {c: 'kfactor', w: 0.18, d: '+'}, {c: 'rainfall', w: 0.16, d: '+'},
+    {c: 'drainageDensity', w: 0.13, d: '+'}, {c: 'ndviDegrade', w: 0.10, d: '+'}, {c: 'burnFreq', w: 0.10, d: '+'},
     {c: 'ecoPressure', w: 0.06, d: '+'}, {c: 'builtPressure', w: 0.04, d: '+'}
   ]},
   'Reforestation': { palette: ['#ffffe5','#d9f0a3','#78c679','#238443','#004529'], criteria: [
-    {c: 'ndviDeficit', w: 0.20, d: '+'}, {c: 'natvegDeficit', w: 0.18, d: '+'},
-    {c: 'ecoRestore', w: 0.16, d: '+'}, {c: 'soc', w: 0.14, d: '+'}, {c: 'rainfall', w: 0.12, d: '+'},
-    {c: 'slope', w: 0.10, d: '+'}, {c: 'roadAccess', w: 0.06, d: '+'}, {c: 'ecoPressure', w: 0.04, d: '+'}
+    {c: 'ndviDeficit', w: 0.18, d: '+'}, {c: 'natvegDeficit', w: 0.16, d: '+'},
+    {c: 'ecoRestore', w: 0.15, d: '+'}, {c: 'soc', w: 0.13, d: '+'}, {c: 'rainfall', w: 0.11, d: '+'},
+    {c: 'slope', w: 0.09, d: '+'}, {c: 'roadAccess', w: 0.05, d: '+'}, {c: 'ecoPressure', w: 0.05, d: '+'},
+    {c: 'burnFreq', w: 0.08, d: '+'}
   ]},
   'Irrigation': { palette: ['#f7fcfd','#bfd3e6','#8c96c6','#88419d','#4d004b'], criteria: [
     {c: 'awc', w: 0.22, d: '+'}, {c: 'slope', w: 0.18, d: '-'}, {c: 'roadAccess', w: 0.15, d: '+'},
@@ -511,10 +590,52 @@ function applyStretch(band, dir, lo, hi) {
   return ee.Image(ee.Algorithms.If(flat, ee.Image(0), s)).toFloat();   // flat -> 0 contribution
 }
 
-// Build one intervention's 0-100 suitability surface (weighted linear combination).
-function buildModel(modelName, region, layers) {
+/* ===================== H) SHARED EXCLUSION MASK (all six models, V9) ==================== */
+/*  No intervention should ever be recommended on top of built-up land or open permanent water -
+ *  applied to ALL SIX models (this replaces the old Wetland-Restoration-only built-up/water
+ *  exclusion, using the same JRC occurrence-based permanent-water definition the model's own
+ *  'permWater'/'hand' criteria already use, which is more temporally robust than a single-date
+ *  WorldCover water class). Agricultural Productivity and Irrigation additionally exclude WDPA
+ *  protected areas - siting NEW cropland/irrigation inside a protected area would be
+ *  inappropriate. Restoration-oriented models (Reforestation, Erosion Control, Flood
+ *  Mitigation, Wetland Restoration) deliberately do NOT exclude WDPA: intervening in/around a
+ *  protected area is often exactly the point, and buildThemes() already treats WDPA as a
+ *  positive biodiversity signal for the cluster typology, not an exclusion. */
+var EXCLUDE_WDPA_FOR = {'Agricultural Productivity': 1, 'Irrigation': 1};
+
+// Optional hook: point this at your own FeatureCollection asset of already-treated/committed
+// intervention footprints (e.g. a tracker of ACReSAL sites already funded) to exclude them from
+// new siting. Left empty by default - no such public dataset exists to wire in automatically.
+var EXISTING_INTERVENTIONS_ASSET = '';
+
+function exclusionMask(modelName, region) {
+  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
+  var builtUp = wc.eq(50);
+  var permWater = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence').unmask(0).gte(50);
+  var exclude = builtUp.or(permWater);
+  if (EXCLUDE_WDPA_FOR[modelName]) {
+    var wdpaFC = ee.FeatureCollection('WCMC/WDPA/current/polygons').filterBounds(region)
+                   .map(function(f) { return f.simplify({maxError: 500}); });
+    exclude = exclude.or(ee.Image().byte().paint(wdpaFC, 1).gt(0).unmask(0));
+  }
+  if (EXISTING_INTERVENTIONS_ASSET) {
+    var existing = ee.FeatureCollection(EXISTING_INTERVENTIONS_ASSET).filterBounds(region);
+    exclude = exclude.or(ee.Image().byte().paint(existing, 1).gt(0).unmask(0));
+  }
+  return exclude.not();   // true = eligible for this model
+}
+
+/* ===================== I) NORMALIZED CRITERIA / WEIGHTED COMPOSITE (V9 refactor) ======== */
+/*  buildModel() used to do the expensive stretch-bound reduceRegion calls AND the weighted sum
+ *  in one shot, so re-scoring with different weights (Monte Carlo sensitivity draws, or a
+ *  user-edited pairwise-AHP weight set) meant repeating the reduceRegion calls every time. Split
+ *  into two steps: buildNormalizedCriteria() does the expensive part once, producing one 0-1,
+ *  direction-corrected band per criterion (band name = criterion key); weightedComposite() is
+ *  pure, cheap band math that can be called many times against the SAME normalized image with
+ *  different weight sets (see runSensitivityAnalysis() and the AHP weight editor in section 3). */
+function buildNormalizedCriteria(modelName, region, layers) {
   var m = MODELS[modelName];
-  var acc = ee.Image(0);
+  var bands = {};
 
   var globalCr = m.criteria.filter(function(cr) { return !ZONE_RELATIVE_CRITERIA[cr.c]; });
   var zoneCr   = m.criteria.filter(function(cr) { return  ZONE_RELATIVE_CRITERIA[cr.c]; });
@@ -529,7 +650,7 @@ function buildModel(modelName, region, layers) {
       var band = layers[cr.c].rename(cr.c).toFloat();
       var lo = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
       var hi = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p98'), globalPct.get(cr.c + '_p98'), 0));
-      acc = acc.add(applyStretch(band, cr.d, lo, hi).multiply(cr.w));
+      bands[cr.c] = applyStretch(band, cr.d, lo, hi).rename(cr.c);
     });
   }
 
@@ -558,26 +679,70 @@ function buildModel(modelName, region, layers) {
         var mask = layers.ecoZone.eq(z);
         return ee.Image(prevImg).where(mask, s.unmask(ee.Image(prevImg)));
       }, ee.Image(0).toFloat()));
-      acc = acc.add(ee.Image(stretched).updateMask(band.mask()).multiply(cr.w));
+      bands[cr.c] = ee.Image(stretched).updateMask(band.mask()).rename(cr.c);
     });
   }
+
+  return ee.Image.cat(m.criteria.map(function(cr) { return bands[cr.c]; }));
+}
+
+// Cheap weighted linear combination of already-normalized (0-1) criterion bands - no
+// reduceRegion here, so it can be called many times (Monte Carlo draws, live AHP weight edits)
+// without repeating buildNormalizedCriteria()'s expensive stretch-bound computation.
+// weightOverrides is an optional {criterionKey: weight} map (renormalized to sum to 1
+// internally, so callers don't have to); omit/null to use the model's own default AHP weights.
+function weightedComposite(modelName, region, layers, normImg, weightOverrides) {
+  var m = MODELS[modelName];
+  var weights = weightOverrides || {};
+  var sumW = 0;
+  m.criteria.forEach(function(cr) { sumW += (weights[cr.c] !== undefined ? weights[cr.c] : cr.w); });
+  var acc = ee.Image(0);
+  m.criteria.forEach(function(cr) {
+    var w = (weights[cr.c] !== undefined ? weights[cr.c] : cr.w) / sumW;
+    acc = acc.add(normImg.select(cr.c).multiply(w));
+  });
 
   var surface = acc.multiply(100).rename('priority').clip(region);
   var gate = climateGateFactor(modelName, layers.aridityZone);
   if (gate) { surface = surface.multiply(gate).rename('priority'); }
-  if (modelName === 'Wetland Restoration') {
-    var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
-    var exclude = wc.eq(80).or(wc.eq(50));   // permanent water & built-up
-    surface = surface.updateMask(exclude.not());
-  }
+  surface = surface.updateMask(exclusionMask(modelName, region));
   return surface;
+}
+
+// Build one intervention's 0-100 suitability surface using its default AHP weights. Thin
+// wrapper over buildNormalizedCriteria()+weightedComposite(), kept for every call site that
+// doesn't need to reuse the normalized bands across multiple weight sets (exports, "download
+// all six", change detection, etc.) - see those two functions for anything that does.
+function buildModel(modelName, region, layers, weightOverrides) {
+  var normImg = buildNormalizedCriteria(modelName, region, layers);
+  return weightedComposite(modelName, region, layers, normImg, weightOverrides);
+}
+
+/* ===================== M) MINIMUM MAPPING UNIT / SIEVE FILTER (V9) ====================== */
+/*  Classifying a continuous suitability surface pixel-by-pixel at 50-100 m produces "salt-and-
+ *  pepper" noise - isolated single pixels of one class scattered inside a larger patch of
+ *  another, which is not actionable for a field team siting a real intervention. This sieves
+ *  out any patch smaller than MIN_PATCH_HA hectares by replacing it with the majority (focal
+ *  mode) class of its neighbourhood - the same idea as GDAL's sieve filter - applied to every
+ *  classified raster (priority classes and intervention clusters alike) before it is shown on
+ *  the map, vectorized, or exported. */
+var MIN_PATCH_HA = 1;   // hectares - patches smaller than this are merged into their neighbourhood
+
+function applyMinMappingUnit(classified, region) {
+  var minPixels = Math.max(1, Math.round((MIN_PATCH_HA * 10000) / (SCALE * SCALE)));
+  var connected = classified.connectedPixelCount(minPixels + 1, true);
+  var smoothed = classified.focalMode({radius: 1.5, kernelType: 'square', units: 'pixels'});
+  var bandName = ee.String(classified.bandNames().get(0));
+  return classified.where(connected.lte(minPixels), smoothed)
+    .updateMask(classified.mask()).rename(bandName).clip(region);
 }
 
 /* ===================== B) FIXED 1-5 PRIORITY CLASSES (map + every export) ============== */
 /*  Reclassifies a continuous 0-100 suitability/priority surface into 5 discrete classes
  *  (1 = lowest priority ... 5 = highest priority) using quintile breaks (20/40/60/80th
  *  percentile) computed once within the region - the same reduceRegion pattern (bestEffort,
- *  tileScale TS) used everywhere else in this script. This is what every export now writes. */
+ *  tileScale TS) used everywhere else in this script. This is what every export now writes.
+ *  V9: the raw classification is now sieved with applyMinMappingUnit() before it's returned. */
 function classifyPriority5(img, region) {
   var bandName = ee.String(img.bandNames().get(0));
   var q = img.reduceRegion({
@@ -588,13 +753,14 @@ function classifyPriority5(img, region) {
   var b2 = ee.Number(q.get(bandName.cat('_p40')));
   var b3 = ee.Number(q.get(bandName.cat('_p60')));
   var b4 = ee.Number(q.get(bandName.cat('_p80')));
-  return ee.Image(1)
+  var cls = ee.Image(1)
     .where(img.gt(b1), 2)
     .where(img.gt(b2), 3)
     .where(img.gt(b3), 4)
     .where(img.gt(b4), 5)
     .updateMask(img.mask())
     .rename('priority_class').toInt().clip(region);
+  return applyMinMappingUnit(cls, region).toInt();
 }
 
 /* ===================== 1b. PROPOSED INTERVENTION CLUSTERS ============================= */
@@ -696,6 +862,8 @@ function buildThemes(region) {
 }
 
 // Classify each pixel into ONE cluster by precedence (Agro > Hydro > Eco > Watershed > Biodiversity).
+// V9: sieved with the same MMU filter as the priority classes (see applyMinMappingUnit) before
+// masking out the "no cluster" (0) background, so the exported typology isn't salt-and-pepper.
 function buildClusters(region) {
   var t = buildThemes(region);
   var agro      = t.agri.and(t.erosion).and(t.flood);
@@ -703,9 +871,10 @@ function buildClusters(region) {
   var eco       = t.reforest.and(t.biodiv).and(t.erosion).or(t.reforest);
   var watershed = t.erosion.and(t.flood);
   var biodiv    = t.biodiv;
-  return ee.Image(0)
+  var raw = ee.Image(0)
     .where(biodiv, 5).where(watershed, 4).where(eco, 3).where(hydro, 2).where(agro, 1)
-    .rename('cluster').clip(region).selfMask();
+    .rename('cluster');
+  return applyMinMappingUnit(raw, region).clip(region).selfMask();
 }
 
 /* ============================ 2. WEIGHTED OVERLAY (legacy slider path) ================= */
@@ -815,11 +984,160 @@ function showModelCriteria() {
       {fontSize: '10px', margin: '4px 4px 2px 4px', color: '#a15c00', fontStyle: 'italic'}));
   }
 }
-modelSelect.onChange(showModelCriteria);
+modelSelect.onChange(function() {
+  showModelCriteria();
+  if (ahpPanel.style().get('shown')) { buildAHPMatrixUI(); }
+});
 showModelCriteria();
 var weightsPanel = ui.Panel([
   ui.Label('Intervention model', {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}),
   modelSelect, modelInfo]);
+
+/* ---- E) Pairwise AHP weight editor + Consistency Ratio (V9) ---------------------------- */
+/*  The six models' weights were asserted, not derived from a pairwise comparison, so there was
+ *  no way to check they were internally consistent (a core AHP credibility check). This lets a
+ *  user re-derive a model's weights from Saaty-scale pairwise judgments (row criterion vs
+ *  column criterion) and reports the Consistency Ratio (CR) - the standard AHP sanity check;
+ *  CR < 0.10 is conventionally "acceptably consistent". Uses the standard closed-form
+ *  approximation to the principal eigenvector (normalise each column to sum to 1, then average
+ *  each row) rather than a full eigen-decomposition - the accepted simplified method for the
+ *  small matrices here (n <= 9) and what most spreadsheet/manual AHP workflows use. */
+// Compact labels - the matrix has to fit an up-to-9x9 grid inside a 380px sidebar panel, so the
+// full Saaty verbal scale (see the instruction label above the matrix) is spelled out once
+// instead of per-cell. If a panel is still too narrow for a wide model, the split-panel divider
+// between the sidebar and the map can usually be dragged wider.
+var SAATY_SCALE = [
+  {label: '1/9', v: 1 / 9}, {label: '1/7', v: 1 / 7}, {label: '1/5', v: 1 / 5}, {label: '1/3', v: 1 / 3},
+  {label: '1', v: 1}, {label: '3', v: 3}, {label: '5', v: 5}, {label: '7', v: 7}, {label: '9', v: 9}
+];
+var SAATY_RI = {1: 0, 2: 0, 3: 0.58, 4: 0.90, 5: 1.12, 6: 1.24, 7: 1.32, 8: 1.41, 9: 1.45, 10: 1.49};
+
+// Deep copy of the built-in AHP weights, kept so "Reset to default weights" can restore them.
+var DEFAULT_MODEL_WEIGHTS = {};
+MODEL_NAMES.forEach(function(mn) {
+  DEFAULT_MODEL_WEIGHTS[mn] = MODELS[mn].criteria.map(function(cr) { return cr.w; });
+});
+function resetModelWeights(modelName) {
+  MODELS[modelName].criteria.forEach(function(cr, i) { cr.w = DEFAULT_MODEL_WEIGHTS[modelName][i]; });
+}
+
+function computeAHPWeights(matrix) {
+  var n = matrix.length, i, j;
+  var colSums = [];
+  for (j = 0; j < n; j++) {
+    var s = 0;
+    for (i = 0; i < n; i++) { s += matrix[i][j]; }
+    colSums.push(s);
+  }
+  var weights = [];
+  for (i = 0; i < n; i++) {
+    var rowSum = 0;
+    for (j = 0; j < n; j++) { rowSum += matrix[i][j] / colSums[j]; }
+    weights.push(rowSum / n);
+  }
+  var lambdaMax = 0;
+  for (i = 0; i < n; i++) {
+    var Aw = 0;
+    for (j = 0; j < n; j++) { Aw += matrix[i][j] * weights[j]; }
+    lambdaMax += Aw / weights[i];
+  }
+  lambdaMax = lambdaMax / n;
+  var ci = (n > 2) ? (lambdaMax - n) / (n - 1) : 0;
+  var ri = SAATY_RI[n] !== undefined ? SAATY_RI[n] : 1.49;
+  var cr = (ri > 0) ? ci / ri : 0;
+  return {weights: weights, lambdaMax: lambdaMax, ci: ci, cr: cr};
+}
+
+var ahpToggleBtn = ui.Button({label: '⚖ Adjust AHP weights (pairwise comparison)',
+  style: {stretch: 'horizontal', margin: '4px 8px 0 8px'}});
+var ahpPanel = ui.Panel({style: {margin: '2px 8px 8px 8px', shown: false}});
+var ahpMatrixPanel = ui.Panel();
+var ahpResultLabel = ui.Label('', {fontSize: '10px', margin: '4px 4px', color: '#444', whiteSpace: 'pre-wrap'});
+var ahpMatrixSelects = [];   // ahpMatrixSelects[i][j] = ui.Select for j>i, else null
+
+function buildAHPMatrixUI() {
+  ahpMatrixPanel.clear();
+  ahpMatrixSelects = [];
+  var m = MODELS[modelSelect.getValue()];
+  var n = m.criteria.length;
+  ahpMatrixPanel.add(ui.Label(
+    'How much more important is the ROW criterion than the COLUMN one? Scale: 1=equal, ' +
+    '3=moderate, 5=strong, 7=very strong, 9=extreme; 1/x = the COLUMN criterion is more ' +
+    'important instead. Only cells above the diagonal are editable (n=' + n + ' criteria - ' +
+    'widen the side panel by dragging its right edge if the row runs off-screen).',
+    {fontSize: '9.5px', color: '#555', margin: '2px 4px 6px 4px'}));
+  for (var i = 0; i < n; i++) {
+    ahpMatrixSelects.push([]);
+    var row = [ui.Label(m.criteria[i].c, {fontSize: '8.5px', margin: '2px', width: '58px'})];
+    for (var j = 0; j < n; j++) {
+      if (j === i) {
+        row.push(ui.Label('1', {fontSize: '8.5px', margin: '1px', width: '26px', textAlign: 'center'}));
+        ahpMatrixSelects[i].push(null);
+      } else if (j > i) {
+        var sel = ui.Select({items: SAATY_SCALE.map(function(s) { return s.label; }),
+          value: '1', style: {width: '38px', fontSize: '8px', margin: '1px'}});
+        row.push(sel);
+        ahpMatrixSelects[i].push(sel);
+      } else {
+        row.push(ui.Label('·', {fontSize: '8.5px', margin: '1px', width: '26px', color: '#bbb', textAlign: 'center'}));
+        ahpMatrixSelects[i].push(null);
+      }
+    }
+    ahpMatrixPanel.add(ui.Panel(row, ui.Panel.Layout.flow('horizontal'), {margin: '0'}));
+  }
+  ahpResultLabel.setValue('');
+}
+
+function readAHPMatrix() {
+  var m = MODELS[modelSelect.getValue()];
+  var n = m.criteria.length;
+  var matrix = [];
+  for (var i = 0; i < n; i++) { matrix.push([]); for (var j = 0; j < n; j++) { matrix[i].push(1); } }
+  for (var i2 = 0; i2 < n; i2++) {
+    for (var j2 = i2 + 1; j2 < n; j2++) {
+      var label = ahpMatrixSelects[i2][j2].getValue();
+      var entry = SAATY_SCALE.filter(function(s) { return s.label === label; })[0];
+      var v = entry ? entry.v : 1;
+      matrix[i2][j2] = v;
+      matrix[j2][i2] = 1 / v;
+    }
+  }
+  return matrix;
+}
+
+var ahpApplyBtn = ui.Button({label: 'Compute & apply weights', style: {stretch: 'horizontal', margin: '2px'}});
+var ahpResetBtn = ui.Button({label: 'Reset to default weights', style: {stretch: 'horizontal', margin: '2px'}});
+ahpApplyBtn.onClick(function() {
+  var modelName = modelSelect.getValue();
+  var matrix = readAHPMatrix();
+  var result = computeAHPWeights(matrix);
+  var m = MODELS[modelName];
+  var consistent = result.cr < 0.10;
+  var lines = m.criteria.map(function(cr, i) { return cr.c + '=' + result.weights[i].toFixed(3); });
+  ahpResultLabel.setValue(
+    'λmax=' + result.lambdaMax.toFixed(3) + '  CI=' + result.ci.toFixed(3) + '  CR=' + result.cr.toFixed(3) +
+    (consistent ? '  ✓ consistent (CR<0.10)' : '  ⚠ INCONSISTENT (CR≥0.10) - applied anyway, but revise your judgments') +
+    '\n' + lines.join(', '));
+  m.criteria.forEach(function(cr, i) { cr.w = result.weights[i]; });
+  showModelCriteria();
+  if (current && current.model === modelName) { run(); }
+});
+ahpResetBtn.onClick(function() {
+  var modelName = modelSelect.getValue();
+  resetModelWeights(modelName);
+  showModelCriteria();
+  buildAHPMatrixUI();
+  ahpResultLabel.setValue('Reset to default AHP weights.');
+  if (current && current.model === modelName) { run(); }
+});
+ahpToggleBtn.onClick(function() {
+  var showing = !ahpPanel.style().get('shown');
+  ahpPanel.style().set('shown', showing);
+  if (showing) { buildAHPMatrixUI(); }
+});
+ahpPanel.add(ahpMatrixPanel);
+ahpPanel.add(ui.Panel([ahpApplyBtn, ahpResetBtn], ui.Panel.Layout.flow('horizontal'), {margin: '4px 0'}));
+ahpPanel.add(ahpResultLabel);
 
 /* ---- Methodology / data-sources info panel (adoptability) ----------------------------- */
 var infoToggleBtn = ui.Button({label: 'ℹ Data sources & methodology', style: {stretch: 'horizontal', margin: '4px 8px'}});
@@ -866,6 +1184,24 @@ function labelled(text, widget) {
   return ui.Panel([ui.Label(text, {fontWeight: 'bold', fontSize: '12px', margin: '8px 8px 2px 8px'}), widget]);
 }
 
+/* ---- K) Two-period comparison / change detection (V9) ---------------------------------- */
+var PERIOD_PRESETS = [
+  {label: '2018-2021 vs 2022-2025 (early vs recent)', a: ['2018-01-01', '2022-01-01'], b: ['2022-01-01', '2026-01-01']},
+  {label: 'Full period vs last 3 years', a: ['2018-01-01', '2026-01-01'], b: ['2023-01-01', '2026-01-01']}
+];
+var periodSelect = ui.Select({items: PERIOD_PRESETS.map(function(p) { return p.label; }),
+  value: PERIOD_PRESETS[0].label, style: {stretch: 'horizontal'}});
+var changeBtn = ui.Button({label: 'Compare periods (change detection)',
+  style: {stretch: 'horizontal', margin: '0 8px 8px 8px'}});
+
+/* ---- L) Exploratory CMIP6 future-rainfall signal (V9, off model weights) --------------- */
+var cmip6Btn = ui.Button({label: 'Show exploratory future-rainfall signal (CMIP6)',
+  style: {stretch: 'horizontal', margin: '0 8px 8px 8px'}});
+
+var moreToolsPanel = ui.Panel([
+  labelled('Change-detection period preset', periodSelect), changeBtn, cmip6Btn
+]);
+
 var controlPanel = ui.Panel({style: {width: '380px', padding: '4px'}, widgets: [
   title, subtitle,
   labelled('Strategic catchment', catchSelect),
@@ -873,15 +1209,17 @@ var controlPanel = ui.Panel({style: {width: '380px', padding: '4px'}, widgets: [
   labelled('LGA', lgaSelect),
   labelled('Output resolution', resSelect), areaHintLabel,
   infoToggleBtn, infoPanel,
-  weightsPanel, runButton, resetButton,
-  clusterButton,
+  weightsPanel, ahpToggleBtn, ahpPanel, runButton, resetButton,
+  clusterButton, moreToolsPanel,
   exportPanel, status]});
 var resultsPanel   = ui.Panel({style: {width: '380px', padding: '4px'}});
 var breakdownPanel = ui.Panel();
 var clusterPanel   = ui.Panel({style: {width: '380px', padding: '4px'}});
+var changePanel    = ui.Panel({style: {width: '380px', padding: '4px'}});
 controlPanel.add(resultsPanel);
 controlPanel.add(allPanel);
 controlPanel.add(clusterPanel);
+controlPanel.add(changePanel);
 
 var map = ui.Map();
 addAdminOverlays();
@@ -986,11 +1324,14 @@ function runWithScale(sel) {
 
   var region = sel.region;
   var layers = criterionLayers(region);
-  var priority = buildModel(modelName, region, layers);
+  // V9: split so the sensitivity analysis (and any future re-weighting) can reuse normImg
+  // without repeating buildNormalizedCriteria()'s reduceRegion calls - see weightedComposite().
+  var normImg = buildNormalizedCriteria(modelName, region, layers);
+  var priority = weightedComposite(modelName, region, layers, normImg, null);
   var priorityClass = classifyPriority5(priority, region);
   var pal = MODELS[modelName].palette;
   current = {priority: priority, priorityClass: priorityClass, region: region, name: sel.name,
-             model: modelName, layers: layers, palette: pal};
+             model: modelName, layers: layers, palette: pal, normImg: normImg};
 
   // Agro-ecological / aridity / elevation zone context layers - off by default, toggle to inspect.
   map.addLayer(layers.aridityZone, {min: 1, max: 5, palette: ARIDITY_ZONE_PALETTE},
@@ -1043,6 +1384,20 @@ function runWithScale(sel) {
   resultsPanel.add(shpB); resultsPanel.add(mShpLabel);
   mTifLabel.setValue(''); mShpLabel.setValue('');
 
+  // V9: candidate site points (centroids of large class-5 patches).
+  resultsPanel.add(ui.Label('Candidate site points (class-5 patches ≥ ' + SITE_MIN_AREA_HA + ' ha)',
+    {fontWeight: 'bold', fontSize: '12px', margin: '10px 8px 2px 8px'}));
+  var siteB = ui.Button({label: 'Site points (interactive)', style: {stretch: 'horizontal', margin: '2px 8px'},
+    onClick: exportSitePoints});
+  var siteDriveB = ui.Button({label: 'Or queue site points as Drive export', style: {stretch: 'horizontal', margin: '2px 8px'},
+    onClick: queueSitePointsToDrive});
+  resultsPanel.add(siteB); resultsPanel.add(siteLabel); resultsPanel.add(siteDriveB);
+  siteLabel.setValue('');
+
+  // V9: Monte Carlo weight-sensitivity analysis.
+  resultsPanel.add(sensitivityBtn); resultsPanel.add(sensitivityLabel);
+  sensitivityLabel.setValue('');
+
   breakdownPanel.clear();
   resultsPanel.add(breakdownPanel);
 
@@ -1054,6 +1409,101 @@ runButton.onClick(run);
 /* ---- Per-model downloads (classified 1-5 raster/vector) ---- */
 var mTifLabel = ui.Label('', {fontSize: '11px', margin: '2px 8px', color: '#1a56cc'});
 var mShpLabel = ui.Label('', {fontSize: '11px', margin: '2px 8px 8px 8px', color: '#1a56cc'});
+
+/* ===================== J) CANDIDATE SITE POINTS (V9) ===================================== */
+/*  Converts the largest class-5 ("very high priority") patches into point candidates - more
+ *  directly actionable for a field team than a raw raster mask. Uses the SAME classified,
+ *  MMU-sieved raster the map/exports already use, so this is consistent with everything else. */
+var SITE_MIN_AREA_HA = 5;   // minimum class-5 patch size (hectares) to generate a candidate point
+var siteLabel = ui.Label('', {fontSize: '11px', margin: '2px 8px 8px 8px', color: '#1a56cc'});
+
+function candidateSitePoints(priorityClass, region, modelName) {
+  var top = priorityClass.eq(5).selfMask();
+  var vec = top.reduceToVectors({
+    geometry: region, scale: SCALE, geometryType: 'polygon', eightConnected: true,
+    maxPixels: 1e10, bestEffort: true, tileScale: TS
+  });
+  vec = vec.map(function(f) { return f.set('area_ha', f.geometry().area(1).divide(10000)); })
+           .filter(ee.Filter.gte('area_ha', SITE_MIN_AREA_HA));
+  return vec.map(function(f) {
+    return ee.Feature(f.geometry().centroid(1), {model: modelName, area_ha: f.get('area_ha'), priority_class: 5});
+  });
+}
+
+function exportSitePoints() {
+  if (!current || !current.priorityClass) { status.setValue('Run a model first.'); return; }
+  siteLabel.setValue('Building candidate site points...'); siteLabel.setUrl('');
+  var pts = candidateSitePoints(current.priorityClass, current.region, current.model);
+  pts.getDownloadURL('SHP', ['model', 'area_ha', 'priority_class'],
+    ('ACReSAL_' + current.model + '_sites_' + current.name).replace(/[^A-Za-z0-9]+/g, '_'),
+    function(url, err) {
+      if (err) { siteLabel.setValue('Site-points error - try Drive export instead: ' + err); return; }
+      siteLabel.setValue('⬇ Download candidate site points (Shapefile)'); siteLabel.setUrl(url);
+    });
+}
+
+function queueSitePointsToDrive() {
+  if (!current || !current.priorityClass) { status.setValue('Run a model first.'); return; }
+  var pts = candidateSitePoints(current.priorityClass, current.region, current.model);
+  Export.table.toDrive({
+    collection: pts,
+    description: ('ACReSAL_' + current.model + '_sites_' + current.name + '_' + SCALE + 'm').replace(/[^A-Za-z0-9]+/g, '_'),
+    fileFormat: 'SHP'
+  });
+  status.setValue('Queued candidate site points - open the Tasks tab and click Run.');
+}
+
+/* ===================== N) MONTE CARLO WEIGHT-SENSITIVITY ANALYSIS (V9) =================== */
+/*  Perturbs each criterion's weight by +/-WEIGHT_PERTURBATION (renormalized to sum to 1) across
+ *  N_MC_DRAWS draws and re-scores the SAME normalized criteria (current.normImg - no repeated
+ *  reduceRegion calls, see weightedComposite()), showing where the result is sensitive to the
+ *  exact AHP weights used vs. robust to them. class5_frequency near 0 or 1 = a stable call;
+ *  near 0.5 = a borderline pixel whose class flips depending on which draw you look at. */
+var N_MC_DRAWS = 24;
+var WEIGHT_PERTURBATION = 0.2;   // +/-20% multiplicative perturbation per criterion weight
+var sensitivityBtn = ui.Button({label: 'Run weight-sensitivity analysis (Monte Carlo, N=' + N_MC_DRAWS + ')',
+  style: {stretch: 'horizontal', margin: '10px 8px 2px 8px'}, onClick: runSensitivityAnalysis});
+var sensitivityLabel = ui.Label('', {fontSize: '10px', margin: '2px 8px 8px 8px', color: '#555'});
+
+function runSensitivityAnalysis() {
+  if (!current || !current.normImg) { status.setValue('Run a model first.'); return; }
+  var modelName = current.model, region = current.region, layers = current.layers, normImg = current.normImg;
+  status.setValue('Running ' + N_MC_DRAWS + '-draw weight-sensitivity analysis for ' + modelName + '...');
+
+  var q = current.priority.reduceRegion({reducer: ee.Reducer.percentile([80]), geometry: region,
+    scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS});
+  var b4 = ee.Number(q.get('priority_p80'));
+
+  var m = MODELS[modelName];
+  var draws = [];
+  for (var i = 0; i < N_MC_DRAWS; i++) {
+    var perturbed = {};
+    m.criteria.forEach(function(cr) { perturbed[cr.c] = cr.w * (1 + (Math.random() * 2 - 1) * WEIGHT_PERTURBATION); });
+    draws.push(weightedComposite(modelName, region, layers, normImg, perturbed));
+  }
+  var drawCol = ee.ImageCollection(draws);
+  var scoreStdDev = drawCol.reduce(ee.Reducer.stdDev()).rename('scoreStdDev');
+  var class5Freq = ee.ImageCollection(draws.map(function(img) { return img.gt(b4).rename('c5'); }))
+                     .reduce(ee.Reducer.mean()).rename('class5_frequency');
+
+  map.addLayer(scoreStdDev, {min: 0, max: 15, palette: ['#ffffcc', '#a1dab4', '#41b6c4', '#225ea8']},
+    modelName + ' - weight sensitivity (score std-dev)', false);
+  map.addLayer(class5Freq, {min: 0, max: 1, palette: ['#ffffff', '#fee08b', '#d73027']},
+    modelName + ' - class-5 stability (frac. of draws)', true);
+
+  ee.Image.cat([scoreStdDev, class5Freq]).reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: region, scale: statsScale(), maxPixels: 1e10,
+    bestEffort: true, tileScale: TS
+  }).evaluate(function(v) {
+    if (!v) { sensitivityLabel.setValue('Sensitivity analysis: no result returned.'); return; }
+    var sd = v.scoreStdDev_mean || 0, c5 = v.class5_frequency_mean || 0;
+    sensitivityLabel.setValue(N_MC_DRAWS + ' draws, weights perturbed +/-' + Math.round(WEIGHT_PERTURBATION * 100) +
+      '%. Mean score std-dev: ' + sd.toFixed(1) + ' pts (of 100). Mean class-5 stability: ' +
+      Math.round(c5 * 100) + '%. Low-stability areas (class-5-stability layer near 0.5) are ' +
+      'borderline calls sensitive to the exact weights used - see the two new map layers.');
+  });
+  status.setValue('');
+}
 
 function modelFileName(modelName) {
   return ('ACReSAL_' + modelName + '_class1to5_' + (current ? current.name : 'area') + '_' + SCALE + 'm')
@@ -1275,6 +1725,118 @@ function queueShapefileToDrive() {
   });
   status.setValue('Queued "ACReSAL_priority_class1to5_' + current.name + '" - open the Tasks tab and click Run.');
 }
+
+/* ===================== K) TWO-PERIOD COMPARISON / CHANGE DETECTION (V9) ================= */
+/*  Re-runs a model for two different date windows and diffs the classified rasters, to see
+ *  where priority is trending up (growing need) vs down (situation improving / addressed).
+ *  buildForPeriod() temporarily overrides the global START/END, builds the model, then restores
+ *  them - safe because every date-dependent call (ee.Date(START), s2Collection(), CHIRPS/
+ *  TerraClimate filters, etc.) reads the JS string value at graph-construction time, not
+ *  lazily, the same pattern SCALE already relies on elsewhere in this script. */
+var currentChange = null;   // {change, clsA, clsB, region, name, model} - set by runChangeDetection()
+
+function buildForPeriod(modelName, region, startDate, endDate) {
+  var savedStart = START, savedEnd = END;
+  START = startDate; END = endDate;
+  var layers = criterionLayers(region);
+  var surface = buildModel(modelName, region, layers);
+  var cls = classifyPriority5(surface, region);
+  START = savedStart; END = savedEnd;
+  return cls;
+}
+
+function runChangeDetection() {
+  var sel = getSelectedRegion();
+  if (!sel) { status.setValue('Select a catchment, or a State/LGA.'); return; }
+  SCALE = currentScale();
+  var modelName = modelSelect.getValue();
+  var preset = PERIOD_PRESETS.filter(function(p) { return p.label === periodSelect.getValue(); })[0];
+  status.setValue('Comparing ' + preset.a.join(' to ') + ' vs ' + preset.b.join(' to ') + ' for ' + modelName + '...');
+  changePanel.clear();
+
+  var clsA = buildForPeriod(modelName, sel.region, preset.a[0], preset.a[1]);
+  var clsB = buildForPeriod(modelName, sel.region, preset.b[0], preset.b[1]);
+  var change = clsB.subtract(clsA).rename('class_change');   // -4..+4
+
+  map.addLayer(clsA, {min: 1, max: 5, palette: MODELS[modelName].palette},
+    modelName + ' priority class - period A (' + preset.a[0] + ' to ' + preset.a[1] + ')', false);
+  map.addLayer(clsB, {min: 1, max: 5, palette: MODELS[modelName].palette},
+    modelName + ' priority class - period B (' + preset.b[0] + ' to ' + preset.b[1] + ')', false);
+  map.addLayer(change, {min: -4, max: 4, palette: ['#08306b', '#4292c6', '#f7f7f7', '#fc8d59', '#b2182b']},
+    modelName + ' priority-class change (B minus A)');
+
+  currentChange = {change: change, clsA: clsA, clsB: clsB, region: sel.region, name: sel.name, model: modelName};
+
+  changePanel.add(ui.Label(modelName + ' change detection: ' + preset.label, {fontWeight: 'bold', margin: '8px 8px 2px 8px'}));
+  changePanel.add(ui.Label('Positive (red) = priority class increased from period A to B (need is growing); ' +
+    'negative (blue) = priority class decreased (situation improved, or already addressed).',
+    {fontSize: '10px', color: '#555', margin: '2px 8px 8px 8px'}));
+
+  var grouped = ee.Image.pixelArea().divide(1e4).addBands(change)
+    .reduceRegion({reducer: ee.Reducer.sum().group(1, 'class_change'), geometry: sel.region,
+      scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS}).get('groups');
+  var changeAreaLabel = ui.Label('Computing change areas...', {fontSize: '11px', margin: '6px 8px'});
+  changePanel.add(changeAreaLabel);
+  ee.List(grouped).evaluate(function(list) {
+    if (!list) { changeAreaLabel.setValue('No change areas returned.'); return; }
+    var by = {};
+    list.forEach(function(g) { by[g.class_change] = g.sum; });
+    var lines = [-4, -3, -2, -1, 0, 1, 2, 3, 4].map(function(v) {
+      return (v > 0 ? '+' + v : String(v)) + ': ' + (by[v] ? Math.round(by[v]).toLocaleString() : '0') + ' ha';
+    });
+    changeAreaLabel.setValue(lines.join('   '));
+  });
+
+  var changeTifBtn = ui.Button({label: 'Queue change-detection GeoTIFF as Drive export',
+    style: {stretch: 'horizontal', margin: '4px 8px'}, onClick: queueChangeGeoTIFFToDrive});
+  changePanel.add(changeTifBtn);
+
+  status.setValue('');
+}
+changeBtn.onClick(runChangeDetection);
+
+function queueChangeGeoTIFFToDrive() {
+  if (!currentChange) { status.setValue('Run change detection first.'); return; }
+  Export.image.toDrive({
+    image: currentChange.change.toInt(),
+    description: ('ACReSAL_' + currentChange.model + '_change_' + currentChange.name + '_' + SCALE + 'm').replace(/[^A-Za-z0-9]+/g, '_'),
+    scale: SCALE, region: currentChange.region, crs: 'EPSG:4326', maxPixels: 1e10
+  });
+  status.setValue('Queued change-detection GeoTIFF - open the Tasks tab and click Run.');
+}
+
+/* ===================== L) EXPLORATORY CMIP6 FUTURE-RAINFALL SIGNAL (V9) ================= */
+/*  Advisory only - deliberately NOT wired into any of the six AHP models' weights, so turning
+ *  this on never silently changes an existing result. Compares projected SSP2-4.5 rainfall
+ *  (2030-2050 mean, averaged across a small multi-model ensemble) against the CMIP6 historical
+ *  baseline (1995-2014 mean) for the SAME models, as a simple % change signal - NOT a full
+ *  downscaled future aridity index (NEX-GDDP-CMIP6 has no PET band), so treat it as a coarse,
+ *  exploratory "is this catchment projected to get wetter or drier" flag, not a validated
+ *  criterion. */
+var CMIP6_MODELS = ['ACCESS-CM2', 'MPI-ESM1-2-HR', 'MRI-ESM2-0', 'NorESM2-MM'];
+var CMIP6_SCENARIO = 'ssp245';
+
+function cmip6RainfallChange(region) {
+  var col = ee.ImageCollection('NASA/GDDP-CMIP6').filterBounds(region)
+              .filter(ee.Filter.inList('model', CMIP6_MODELS));
+  var hist = col.filter(ee.Filter.eq('scenario', 'historical'))
+                .filterDate('1995-01-01', '2015-01-01').select('pr').mean()
+                .multiply(86400).multiply(365.25).rename('pr_hist');   // kg/m2/s -> mm/yr
+  var fut = col.filter(ee.Filter.eq('scenario', CMIP6_SCENARIO))
+               .filterDate('2030-01-01', '2050-01-01').select('pr').mean()
+               .multiply(86400).multiply(365.25).rename('pr_fut');
+  return fut.subtract(hist).divide(hist.max(1)).multiply(100).rename('pr_pct_change');
+}
+
+cmip6Btn.onClick(function() {
+  var sel = getSelectedRegion();
+  if (!sel) { status.setValue('Select a catchment, or a State/LGA.'); return; }
+  status.setValue('Computing exploratory CMIP6 rainfall-change signal (not part of any model score)...');
+  var change = cmip6RainfallChange(sel.region).clip(sel.region);
+  map.addLayer(change, {min: -30, max: 30, palette: ['#a50026', '#fee08b', '#ffffff', '#abd9e9', '#313695']},
+    'EXPLORATORY: projected rainfall change % (SSP2-4.5, 2030-2050 vs 1995-2014)');
+  status.setValue('');
+});
 
 /* ============================ 5. CLICK -> PIXEL BREAKDOWN ============================ */
 
