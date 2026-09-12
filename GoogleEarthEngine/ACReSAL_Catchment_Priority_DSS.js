@@ -93,6 +93,21 @@
  *      (hand/upa/twi/streams) - interpolating routed hydrology values between pixels can
  *      manufacture false intermediate stream cells, so those keep their native handling.
  *
+ *  V8 - fixes "Image.reduceRegion: Too many pixels in the region. Found 12657628, but
+ *       maxPixels allows only 10000000" at the new finer default resolution (V7). Every
+ *       reduceRegion() (and ui.Chart.image.histogram()) in this script already set
+ *       bestEffort:true and maxPixels:1e10, but several use a GROUPED reducer
+ *       (Reducer.group(), for the per-zone percentile stats and the area-by-class/cluster
+ *       tables) - and bestEffort's automatic scale-coarsening is not reliably honoured for
+ *       those, so once a catchment/State at the new 50-100 m default reached ~10M+ pixels the
+ *       hard cap still fired. Every reduceRegion()/histogram call here only ever produces a
+ *       SCALAR summary (a percentile bound, a classification threshold, an area total) -
+ *       never the output raster itself, which is always computed by direct band math at the
+ *       full SCALE regardless of what scale its inputs were summarised at - so statsScale()
+ *       now pins these summary calls to max(SCALE, 250 m) instead of relying on bestEffort,
+ *       independent of the fine SCALE used for the priority surface, its classification, and
+ *       every export (GeoTIFF/Shapefile), which are untouched by this fix.
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
@@ -109,6 +124,21 @@ var PRIORITY_PALETTE = ['#1a9850','#91cf60','#fee08b','#fc8d59','#d73027']; // 5
 var PRIORITY_CLASS_LABELS = ['1 - Very Low', '2 - Low', '3 - Moderate', '4 - High', '5 - Very High'];
 var TS = 10;                                        // tileScale for heavy reduceRegion calls (bumped from 8 for the finer default SCALE)
 var RESOLUTION_OPTIONS_M = [50, 60, 100];           // user-selectable output resolutions (fix D)
+var STATS_SCALE_FLOOR = 250;                        // metres - floor for scalar-summary reduceRegion calls (see statsScale())
+
+// Every reduceRegion()/histogram call in this script computes a SCALAR summary only
+// (percentile stretch bounds, classification thresholds, per-zone thresholds, area totals) -
+// never the output raster itself, which is always produced by direct band math at the full,
+// user-selected SCALE. So these summary calls sample at max(SCALE, 250 m) instead of the full
+// output resolution: Earth Engine's bestEffort auto-coarsening is not reliably honoured for
+// every reducer (grouped reducers - Reducer.group(), used for the per-zone stats and the area-
+// by-class/cluster tables - have been observed to still throw "Too many pixels in the region"
+// even with bestEffort:true and an explicit large maxPixels once the region+scale pixel count
+// passes ~10 million), so the scale is pinned directly here instead of relying on that. A
+// 250 m sample is already far more than enough to estimate a percentile/threshold/area total
+// accurately - even Nigeria's largest State (Niger, ~76,000 km2) is only ~1.2M pixels at
+// 250 m, comfortably under any maxPixels default.
+function statsScale() { return Math.max(SCALE, STATS_SCALE_FLOOR); }
 
 /* ---------------------------- SCALE-AWARE HELPERS (fix G) ------------------------------- */
 // Converts a fixed real-world search distance (km) into a pixel radius at the CURRENTLY
@@ -494,7 +524,7 @@ function buildModel(modelName, region, layers) {
   if (globalCr.length > 0) {
     var globalImg = ee.Image.cat(globalCr.map(function(cr) { return layers[cr.c].rename(cr.c).toFloat(); }));
     var globalPct = globalImg.reduceRegion({reducer: ee.Reducer.percentile([2, 98]), geometry: region,
-      scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS});
+      scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS});
     globalCr.forEach(function(cr) {
       var band = layers[cr.c].rename(cr.c).toFloat();
       var lo = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
@@ -514,7 +544,7 @@ function buildModel(modelName, region, layers) {
                           .addBands(layers.ecoZone.rename('zone'));
     var zoneGroups = ee.List(zoneImgMulti.reduceRegion({
       reducer: ee.Reducer.percentile([2, 98]).group({groupField: zoneCr.length, groupName: 'zone'}),
-      geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+      geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
     }).get('groups'));
 
     zoneCr.forEach(function(cr) {
@@ -552,7 +582,7 @@ function classifyPriority5(img, region) {
   var bandName = ee.String(img.bandNames().get(0));
   var q = img.reduceRegion({
     reducer: ee.Reducer.percentile([20, 40, 60, 80]), geometry: region,
-    scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+    scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
   });
   var b1 = ee.Number(q.get(bandName.cat('_p20')));
   var b2 = ee.Number(q.get(bandName.cat('_p40')));
@@ -607,7 +637,7 @@ function buildThemes(region) {
   var C = ndviMean.multiply(-1).add(1).clamp(0, 1);
   var erosionIdx = R.multiply(LS).multiply(K).multiply(C);
   var erThr = ee.Number(erosionIdx.reduceRegion({reducer: ee.Reducer.percentile([66]),
-    geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS}).values().get(0));
+    geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS}).values().get(0));
   var erosion = erosionIdx.gte(erThr).unmask(0);
 
   // Flood-prone: low height above nearest drainage (MERIT Hydro), < 5 m
@@ -643,7 +673,7 @@ function buildThemes(region) {
   // .contains() checks existence without throwing (unlike calling .get() on a missing key).
   var ndviZoneGroups = ee.List(ndviMean.addBands(ecoZone.rename('zone')).reduceRegion({
     reducer: ee.Reducer.percentile([40]).setOutputs(['ndviP40']).group({groupField: 1, groupName: 'zone'}),
-    geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+    geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).get('groups'));
   var ndviSparse = ee.Image(ndviZoneGroups.iterate(function(g, prevImg) {
     g = ee.Dictionary(g);
@@ -694,7 +724,7 @@ function buildPriority(region) {
 
   var pct = crit.reduceRegion({
     reducer: ee.Reducer.percentile([2, 98]),
-    geometry: region, scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS
+    geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
   });
 
   var w = getWeightFractions().fracs;
@@ -977,7 +1007,7 @@ function runWithScale(sel) {
   // area (ha) per priority class within the region
   var grouped = ee.Image.pixelArea().divide(1e4).addBands(priorityClass)
     .reduceRegion({reducer: ee.Reducer.sum().group(1, 'priority_class'), geometry: region,
-                   scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS}).get('groups');
+                   scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS}).get('groups');
   var areaLabel = ui.Label('Computing class areas...', {fontSize: '12px', margin: '8px'});
   ee.List(grouped).evaluate(function(list) {
     if (!list) { areaLabel.setValue('No class areas returned.'); return; }
@@ -989,7 +1019,8 @@ function runWithScale(sel) {
     areaLabel.setValue(modelName + ' - area by priority class\n' + lines.join('\n'));
   });
 
-  var hist = ui.Chart.image.histogram({image: priority, region: region, scale: SCALE, maxBuckets: 30})
+  var hist = ui.Chart.image.histogram({image: priority, region: region, scale: statsScale(),
+      maxBuckets: 30, maxPixels: 1e10})
     .setOptions({title: modelName + ' suitability distribution (pre-classification)',
                  hAxis: {title: 'Suitability (0-100)'},
                  vAxis: {title: 'Pixels'}, legend: {position: 'none'}, colors: [pal[3]]});
@@ -1125,7 +1156,7 @@ function runClustersWithScale(sel) {
 
   var grouped = ee.Image.pixelArea().divide(1e4).addBands(cls)
     .reduceRegion({reducer: ee.Reducer.sum().group(1, 'cluster'), geometry: region,
-                   scale: SCALE, maxPixels: 1e10, bestEffort: true, tileScale: TS}).get('groups');
+                   scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS}).get('groups');
   var areaLab = ui.Label('Computing cluster areas...', {fontSize: '11px', margin: '6px 8px', color: '#0b6623'});
   clusterPanel.add(areaLab);
   ee.List(grouped).evaluate(function(list) {
