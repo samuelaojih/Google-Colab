@@ -174,6 +174,31 @@
  *   as burnFreq above if/when a specific, verified asset ID is available (e.g. a licensed
  *   livestock density raster or a project-specific conflict-risk layer).
  *
+ *  V9.1 - fixes two errors surfaced by an actual Drive-export run of V9:
+ *
+ *   1) "Expected a homogeneous image collection... Mismatched type for band 'time': Expected
+ *      type: Float<0.0,0.0>. Actual type: Float<1.0,1.0>." - s2NdviTrend() built its 'time' band
+ *      directly from `y.subtract(y0)`, a value derived purely from ee.List.sequence()'s known
+ *      bounds, which Earth Engine can (and does) evaluate to an EXACT constant at graph-
+ *      construction time - so each per-year image got a distinct, narrow inferred type
+ *      (Float<0,0>, Float<1,1>, ...) instead of a generic float, and ee.ImageCollection()
+ *      rejects that as non-homogeneous. Fixed by tagging each annual composite with
+ *      'system:time_start' and deriving 'time' from img.date().difference(...) in a separate
+ *      .map() pass - a RUNTIME per-image metadata lookup EE can't collapse to an exact
+ *      constant, exactly the pattern the legacy MODIS-based trend already used (and never hit
+ *      this bug for that reason).
+ *
+ *   2) "Reducer.group: Reducer.group groupField out of range." - the zone-relative percentile
+ *      reducer (ee.Reducer.percentile([2,98]), natural arity 1) auto-repeats across however
+ *      many data bands it's given when used WITHOUT .group() (that's how the plain globalPct
+ *      call works on a multi-band image), but that auto-repeat is ambiguous once .group() is
+ *      layered on top with MORE THAN ONE data band - which only happens for Agricultural
+ *      Productivity (the only model with two zone-relative criteria, 'ndvi' and 'ndviCond';
+ *      every other model has at most one). Fixed by calling .repeat(zoneCr.length) before
+ *      .group() (and the matching .repeat(1) on the single-criterion reforestation-theme
+ *      version in buildThemes()) so the reducer's input arity - and therefore .group()'s
+ *      groupField index - is explicit instead of inferred.
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
@@ -295,6 +320,17 @@ function s2NdwiMedian(region) { return s2Collection(region).select('NDWI').media
 
 // Multi-year NDVI trend from annual Sentinel-2 median composites (2018 -> END), replacing the
 // old per-16-day MODIS linear fit. Same linearFit() pattern; 'scale' band = slope per year.
+//
+// V9.1 fix: building the 'time' band directly from `y.subtract(y0)` - a value EE can compute
+// exactly at graph-construction time from the known ee.List.sequence() bounds - gave every
+// per-year image's 'time' band a distinct, narrow inferred type (Float<0,0>, Float<1,1>, ...),
+// which ee.ImageCollection() then rejects as non-homogeneous ("Mismatched type for band
+// 'time'... Image ID: 1"). The legacy MODIS-based trend never had a distinct 'time' band for
+// this reason: it derived time from img.date().difference(...) - a RUNTIME per-image metadata
+// lookup EE can't collapse to an exact compile-time constant - so every image's 'time' band
+// stays a generic (homogeneous) Float. Same fix here: tag each composite with
+// 'system:time_start' during construction, then derive 'time' from .date() in a separate .map()
+// over the resulting (otherwise plain) ImageCollection.
 function s2NdviTrend(region) {
   var col = s2Collection(region).select('NDVI');
   var y0 = ee.Number(ee.Date(START).get('year'));
@@ -304,11 +340,13 @@ function s2NdviTrend(region) {
     y = ee.Number(y);
     var yStart = ee.Date.fromYMD(y, 1, 1);
     var yEnd = yStart.advance(1, 'year');
-    var comp = col.filterDate(yStart, yEnd).median();          // band 'NDVI'
-    var t = y.subtract(y0).float();
-    return comp.addBands(ee.Image.constant(t).rename('time')); // bands ['NDVI', 'time']
+    return col.filterDate(yStart, yEnd).median().set('system:time_start', yStart.millis());
   }));
-  return annual.select(['time', 'NDVI']).reduce(ee.Reducer.linearFit()).select('scale');
+  var withTime = annual.map(function(img) {
+    var t = img.date().difference(ee.Date(START), 'year');
+    return ee.Image.constant(t).float().rename('time').addBands(img.select('NDVI'));
+  });
+  return withTime.select(['time', 'NDVI']).reduce(ee.Reducer.linearFit()).select('scale');
 }
 
 /* ============================ 1. CRITERIA IMAGERY (legacy slider path) ================= */
@@ -660,11 +698,21 @@ function buildNormalizedCriteria(modelName, region, layers) {
   // per-zone stats for every band in a single pass (same 'groups' pattern already used for
   // area-by-cluster and area-by-class elsewhere in this script), then a server-side .iterate()
   // recombines the per-zone stretch into one image without any extra reduceRegion calls.
+  //
+  // V9.1 fix ("Reducer.group: groupField out of range"): ee.Reducer.percentile([2,98]) has a
+  // natural arity of 1 and auto-repeats across however many bands it's given when used
+  // un-grouped (that's how the globalPct call above works on a multi-band image with no extra
+  // setup) - but that auto-repeat is ambiguous once .group() is layered on top with MORE THAN
+  // ONE data band (only Agricultural Productivity hits this: 'ndvi' + 'ndviCond' are both
+  // zone-relative, so zoneCr.length is 2 there, 1 everywhere else zoneCr is non-empty). Calling
+  // .repeat(zoneCr.length) first makes the arity explicit, so .group()'s groupField index (the
+  // band placed right after those zoneCr.length repeated inputs) is unambiguous regardless of
+  // how many zone-relative criteria a model has.
   if (zoneCr.length > 0) {
     var zoneImgMulti = ee.Image.cat(zoneCr.map(function(cr) { return layers[cr.c].rename(cr.c).toFloat(); }))
                           .addBands(layers.ecoZone.rename('zone'));
     var zoneGroups = ee.List(zoneImgMulti.reduceRegion({
-      reducer: ee.Reducer.percentile([2, 98]).group({groupField: zoneCr.length, groupName: 'zone'}),
+      reducer: ee.Reducer.percentile([2, 98]).repeat(zoneCr.length).group({groupField: zoneCr.length, groupName: 'zone'}),
       geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
     }).get('groups'));
 
@@ -837,8 +885,11 @@ function buildThemes(region) {
   // actually just 'NDVI', so a hardcoded '_p40' guess threw "Dictionary does not contain key".
   // .setOutputs() pins the key explicitly instead of relying on that naming convention, and
   // .contains() checks existence without throwing (unlike calling .get() on a missing key).
+  // V9.1: .repeat(1) makes the reducer's arity explicit before .group() is layered on - see the
+  // matching fix (and full explanation) on the zone-relative reduceRegion in
+  // buildNormalizedCriteria() above ("Reducer.group: groupField out of range").
   var ndviZoneGroups = ee.List(ndviMean.addBands(ecoZone.rename('zone')).reduceRegion({
-    reducer: ee.Reducer.percentile([40]).setOutputs(['ndviP40']).group({groupField: 1, groupName: 'zone'}),
+    reducer: ee.Reducer.percentile([40]).repeat(1).setOutputs(['ndviP40']).group({groupField: 1, groupName: 'zone'}),
     geometry: region, scale: statsScale(), maxPixels: 1e10, bestEffort: true, tileScale: TS
   }).get('groups'));
   var ndviSparse = ee.Image(ndviZoneGroups.iterate(function(g, prevImg) {
