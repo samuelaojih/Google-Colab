@@ -199,11 +199,49 @@
  *      version in buildThemes()) so the reducer's input arity - and therefore .group()'s
  *      groupField index - is explicit instead of inferred.
  *
+ *  V10 - fixes a units bug that silently broke drainage-network criteria across four models,
+ *       and redesigns Flood Mitigation for big-river/floodplain flooding (e.g. Benue-Mada),
+ *       not just small-stream/flash-flood terrain proxies.
+ *
+ *   BUG FIX (units): 'streams' was `upa.gt(1e6)`, commented as "> 1 km2 contributing area" -
+ *      true only if MERIT Hydro's 'upa' band were in m^2. It is actually in km^2 (verified
+ *      against the EE data catalog), so the real threshold was ">1,000,000 km2 contributing
+ *      area" - a bar so high that almost no pixel in any Nigerian catchment ever cleared it
+ *      (even the Benue's entire basin is ~319,000 km2). With 'streams' effectively all-false,
+ *      drainageProx (distance-to-channel) and drainageDensity came out flat/constant across
+ *      the region, and applyStretch()'s flat-band guard then silently zeroed their
+ *      contribution - 18% of Flood Mitigation's weight, 20% of Wetland Restoration's, 9% of
+ *      Irrigation's, and 13% of Erosion Control's (via drainageDensity) were contributing
+ *      nothing. Fixed to the actually-intended `upa.gt(1)`. This is very likely why priority
+ *      surfaces looked poorly differentiated ("flood is over the top") for large-catchment,
+ *      river-floodplain cases in particular.
+ *
+ *   FLOOD MITIGATION REDESIGN: even with the units bug fixed, the model was still built almost
+ *      entirely from terrain proxies answering "would this pixel be wet if water showed up,"
+ *      tuned by a small-stream network more relevant to gully/flash-flood dynamics than to a
+ *      major lowland river's floodplain (Benue, Niger, Katsina-Ala, Gongola, Hadejia-Komadugu-
+ *      Yobe, and tributaries like the Mada). Three changes:
+ *        - majorRiverProx replaces drainageProx: distance to a river with >= MAJOR_RIVER_UPA_KM2
+ *          (500 km2, a conventional named-river cutoff) upstream area, not the fine >1 km2
+ *          network - a big river's floodplain extends far past "nearest small tributary."
+ *        - floodSeasonality (NEW): JRC GSW 'seasonality' band - the number of months/year a
+ *          pixel is actually observed as water, i.e. real historical flood evidence, not a
+ *          terrain proxy. Complementary to (not redundant with) the permanent-water exclusion
+ *          in exclusionMask(), which is keyed on a much higher, non-seasonal 'occurrence'
+ *          threshold and so does not exclude seasonally-flooded (but not permanently wet) land.
+ *        - heavyRainDays replaces plain mean-annual rainfall: CHIRPS days/year with
+ *          >= HEAVY_RAIN_MM_DAY mm (20 mm, a standard ETCCDI "very heavy rain day" index) -
+ *          flood-triggering rainfall extremity, not just the annual total (a place can reach
+ *          the same annual total from many moderate days or a handful of catastrophic ones;
+ *          it is the latter pattern that actually produces floods).
+ *      Other models' criteria (drainageProx, plain rainfall, etc.) are unchanged apart from the
+ *      units bug fix above.
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
 
-var SCMP = ee.FeatureCollection('projects/ee-samuelcoolsdk/assets/SCMP_SHAPEFILES');
+var SCMP = ee.FeatureCollection('projects/ee-samuelaojih/assets/SCMP_SHAPEFILES');
 
 /* ============================ 0. CONFIG ================================================== */
 
@@ -216,6 +254,8 @@ var PRIORITY_CLASS_LABELS = ['1 - Very Low', '2 - Low', '3 - Moderate', '4 - Hig
 var TS = 10;                                        // tileScale for heavy reduceRegion calls (bumped from 8 for the finer default SCALE)
 var RESOLUTION_OPTIONS_M = [50, 60, 100];           // user-selectable output resolutions (fix D)
 var STATS_SCALE_FLOOR = 250;                        // metres - floor for scalar-summary reduceRegion calls (see statsScale())
+var MAJOR_RIVER_UPA_KM2 = 500;                      // km^2 upstream area cutoff for a "major river" (V10, Flood Mitigation)
+var HEAVY_RAIN_MM_DAY = 20;                         // mm/day - ETCCDI-style "very heavy rain day" threshold (V10, Flood Mitigation)
 
 // Every reduceRegion()/histogram call in this script computes a SCALAR summary only
 // (percentile stretch bounds, classification thresholds, per-zone thresholds, area totals) -
@@ -428,14 +468,61 @@ function criterionLayers(region) {
   // manufacture false intermediate stream cells), so these keep MERIT Hydro's native handling.
   var flowAcc = ee.Image('MERIT/Hydro/v1_0_1');       // has 'upa' (upstream area), 'hnd' (HAND)
   var hand    = flowAcc.select('hnd').unmask(0);
-  var upa     = flowAcc.select('upa').unmask(0);
+  var upa     = flowAcc.select('upa').unmask(0);      // MERIT Hydro's 'upa' is already in km^2 (verified against the EE catalog) - NOT m^2
   var slopeRad = slope.multiply(Math.PI / 180).max(0.001);
   var twi = upa.add(1).log().subtract(slopeRad.tan().log()).rename('twi');
-  var streams = upa.gt(1e6);                            // >1 km2 contributing area = channel
+  // V10 FIX (units): this was `upa.gt(1e6)`, i.e. ">1,000,000 km2 contributing area" - the
+  // comment's intent ("> 1 km2 contributing area = channel", the standard channel-forming
+  // threshold) only holds if 'upa' were in m^2. It is actually in km^2, so the old threshold
+  // was 1e6x too strict: almost no pixel in ANY Nigerian catchment has 1,000,000 km2 of
+  // upstream area (even the Benue's entire basin is ~319,000 km2), so 'streams' was silently
+  // all-false (or all-true along a handful of pixels at most) for nearly every catchment. That
+  // made drainageProx/drainageDensity - a distance-to-channel and channel-density measure -
+  // flat/constant across the region, which applyStretch()'s flat-band guard then silently
+  // zeroes out: 18% of Flood Mitigation's weight, 20% of Wetland Restoration's, 9% of
+  // Irrigation's, and 13% (via drainageDensity) of Erosion Control's were contributing nothing.
+  // Fixed to the actually-intended threshold, `upa.gt(1)`.
+  var streams = upa.gt(1);                              // >1 km2 contributing area = channel
   // fix G: fixed real-world search radius regardless of the chosen output SCALE.
   var drainageProx = streams.fastDistanceTransform(searchRadiusPixels(20), 'pixels').sqrt()
                        .multiply(ee.Image.pixelArea().sqrt()).rename('drainageProx');
   var drainageDensity = streams.unmask(0).focalMean(2000, 'circle', 'meters').rename('drainageDensity');
+
+  // V10: MAJOR-RIVER network, distinct from the fine "any channel > 1 km2" streams network
+  // above. A big lowland river's floodplain (Benue, Niger, Katsina-Ala, Gongola, Hadejia-
+  // Komadugu-Yobe, and their major tributaries like the Mada) extends far wider than a small
+  // gully or minor tributary's, so "distance to the nearest big river" is a materially
+  // different - and for large-catchment fluvial flooding, more relevant - signal than
+  // "distance to the nearest 1 km2 channel" (which is dominated by whatever tiny local stream
+  // happens to be closest). MAJOR_RIVER_UPA_KM2 = 500 km2 is a conventional cutoff for a named,
+  // mapped tributary/mainstem river rather than minor local drainage; search radius is widened
+  // to 100 km (vs. 20 km for the fine network) since major rivers are much sparser.
+  var majorStreams = upa.gt(MAJOR_RIVER_UPA_KM2);
+  var majorRiverProx = majorStreams.fastDistanceTransform(searchRadiusPixels(100), 'pixels').sqrt()
+                         .multiply(ee.Image.pixelArea().sqrt()).rename('majorRiverProx');
+
+  // V10: JRC Global Surface Water 'seasonality' band (0-12: number of months per year a pixel
+  // is typically detected as water) - the strongest available EMPIRICAL evidence of historical
+  // seasonal flood inundation, as opposed to the terrain-only proxies (hand/twi/upa) above,
+  // which only say "this pixel WOULD be wet if water showed up," not "this pixel has actually
+  // been observed flooding." A seasonally-flooded floodplain (wet a few months/year, dry the
+  // rest) shows up here even though its 'occurrence' (used by exclusionMask/permWater) stays
+  // well under the 50% threshold that excludes permanent water - the two are complementary, not
+  // redundant. Native 30 m, finer than every output resolution offered, so no resample needed.
+  var floodSeasonality = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('seasonality')
+                           .unmask(0).rename('floodSeasonality');
+
+  // V10: heavy-rainfall-day frequency (CHIRPS daily, days/year with >= HEAVY_RAIN_MM_DAY mm) -
+  // a standard ETCCDI-style extreme-precipitation index (commonly "R20mm"), and a much more
+  // direct flood-triggering signal than mean annual rainfall: a place can have high annual
+  // totals from many moderate days, or the same total from a handful of catastrophic downpours -
+  // it is the latter pattern that actually produces flash/river floods. Same cheap "count how
+  // many days/images cross a threshold, then average per year" pattern already used for
+  // burnFreq above, so it stays inexpensive despite CHIRPS DAILY being a large collection.
+  var heavyRainDays = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate(START, END)
+                        .filterBounds(region).select('precipitation')
+                        .map(function(img) { return img.gte(HEAVY_RAIN_MM_DAY); }).sum()
+                        .divide(nYears).resample('bilinear').rename('heavyRainDays');
 
   // Rainfall (CHIRPS, ~5.5 km native). fix G: bilinear resample - it is a smooth continuous
   // field, so interpolating it onto the finer 50-100 m output grid avoids blocky nearest-
@@ -531,6 +618,7 @@ function criterionLayers(region) {
     soc: soc, roadAccess: roadAccess, awc: awc, ndvi: ndvi, ndviCond: ndviCond,
     ph: ph, cropland: cropland, ndwi: ndwi, permWater: permWater,
     ecoCondition: ecoCondition, wetlandSignal: wetlandSignal, burnFreq: burnFreq,
+    majorRiverProx: majorRiverProx, floodSeasonality: floodSeasonality, heavyRainDays: heavyRainDays,
     aridityIdx: aridityIdx, aridityZone: aridityZone,
     elevationZone: elevationZone, ecoZone: ecoZone
   };
@@ -538,10 +626,18 @@ function criterionLayers(region) {
 
 // Each model: list of {c: criterion key, w: AHP weight, d: direction '+'/'-'}.
 var MODELS = {
+  // V10: redesigned for large-river/floodplain flooding (Benue-Mada-scale catchments), not just
+  // small-stream/flash-flood terrain proxies. drainageProx (distance to the nearest ANY-channel,
+  // >1 km2) is replaced here by majorRiverProx (distance to a >=500 km2 river specifically) -
+  // a big river's floodplain extends far past what "nearest small tributary" captures.
+  // floodSeasonality (JRC seasonality band) adds actual historical observed inundation, the
+  // strongest empirical signal this model had no way to use before. heavyRainDays (CHIRPS,
+  // days/year >=20 mm) replaces plain mean annual rainfall with a flood-triggering-extremes
+  // signal. See criterionLayers() for how each of these three is built.
   'Flood Mitigation': { palette: ['#f7fbff','#9ecae1','#4292c6','#08519c','#08306b'], criteria: [
-    {c: 'hand', w: 0.22, d: '-'}, {c: 'drainageProx', w: 0.18, d: '-'}, {c: 'upa', w: 0.16, d: '+'},
-    {c: 'twi', w: 0.14, d: '+'}, {c: 'rainfall', w: 0.12, d: '+'}, {c: 'pop', w: 0.10, d: '+'},
-    {c: 'built', w: 0.08, d: '+'}
+    {c: 'hand', w: 0.16, d: '-'}, {c: 'majorRiverProx', w: 0.16, d: '-'}, {c: 'upa', w: 0.14, d: '+'},
+    {c: 'twi', w: 0.12, d: '+'}, {c: 'floodSeasonality', w: 0.18, d: '+'}, {c: 'heavyRainDays', w: 0.12, d: '+'},
+    {c: 'pop', w: 0.08, d: '+'}, {c: 'built', w: 0.04, d: '+'}
   ]},
   // V9: burnFreq (MODIS MCD64A1 burned-area frequency) added as a degradation-driver criterion;
   // other weights rescaled so the model still sums to 1.00.
@@ -1204,7 +1300,12 @@ infoPanel.add(ui.Label(
   'sparse vegetation in a Sahel-Montane pocket (e.g. an isolated highland) is judged against ' +
   'that pocket\'s own norm, not the surrounding lowland\'s. Output/analysis resolution is user-' +
   'selectable (50/60/100 m); every export writes fixed 1-5 priority classes (quintile breaks), ' +
-  'not the raw 0-100 suitability surface.',
+  'not the raw 0-100 suitability surface. Flood Mitigation additionally uses: majorRiverProx ' +
+  '(distance to a >=500 km2 river, distinct from the small-stream network other criteria use), ' +
+  'floodSeasonality (JRC seasonality band - actual historical months/year a pixel is observed ' +
+  'flooded, not just a terrain proxy), and heavyRainDays (CHIRPS days/year >=20 mm) in place of ' +
+  'mean annual rainfall - tuned for big-river floodplain catchments (e.g. Benue-Mada) rather ' +
+  'than small-stream flash flooding alone.',
   {fontSize: '10px', color: '#555', margin: '2px 4px'}));
 infoToggleBtn.onClick(function() { infoPanel.style().set('shown', !infoPanel.style().get('shown')); });
 

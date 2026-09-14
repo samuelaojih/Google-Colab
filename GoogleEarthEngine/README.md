@@ -72,6 +72,37 @@ there is essentially no rainfall to ever generate that runoff. Erosion Control i
 deliberately not gated this way - semi-arid zones are classically the most
 erosion-prone (sparse cover + intense convective storms).
 
+## Flood Mitigation, and a units bug that affected four models
+
+MERIT Hydro's `upa` (upstream drainage area) band is in **km²**, not m². The stream
+network used to be built as `upa.gt(1e6)`, commented as ">1 km² contributing area" -
+that comment is only true if `upa` were in m². The real effect was a threshold of
+1,000,000 km², which almost no pixel in any Nigerian catchment ever clears (even the
+Benue's entire basin is ~319,000 km²). With the stream network effectively empty,
+`drainageProx` and `drainageDensity` came out flat across the whole catchment, and the
+script's own flat-band guard then silently contributed nothing from them - **18% of
+Flood Mitigation's weight, 20% of Wetland Restoration's, 9% of Irrigation's, and 13% of
+Erosion Control's** were doing nothing. Fixed to the actually-intended `upa.gt(1)`.
+
+On top of that fix, **Flood Mitigation is redesigned for big-river/floodplain flooding**
+(Benue-Mada-scale catchments), not just small-stream/flash-flood terrain proxies:
+
+- `majorRiverProx` (replaces `drainageProx` for this model only) - distance to a river
+  with ≥ `MAJOR_RIVER_UPA_KM2` (500 km²) upstream area, not the fine >1 km² network. A
+  major river's floodplain extends far past "nearest small tributary."
+- `floodSeasonality` (new) - JRC Global Surface Water's `seasonality` band: the number
+  of months per year a pixel is actually *observed* as water - real historical flood
+  evidence, not a terrain proxy. It's complementary to (not redundant with) the
+  permanent-water exclusion in `exclusionMask()`, which is keyed on a much higher,
+  non-seasonal `occurrence` threshold and so doesn't exclude seasonally-flooded land.
+- `heavyRainDays` (replaces plain mean-annual rainfall for this model only) - CHIRPS
+  days/year with ≥ `HEAVY_RAIN_MM_DAY` (20 mm), a standard ETCCDI-style "very heavy
+  rain day" extreme-precipitation index - a more direct flood-triggering signal than
+  an annual total, which can hide a handful of catastrophic downpours behind an
+  otherwise-moderate year.
+
+Other models' criteria are unchanged apart from the units bug fix above.
+
 ## Analysis add-ons
 
 - **Shared exclusion mask.** No model recommends siting on built-up land or open
