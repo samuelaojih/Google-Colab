@@ -41,6 +41,7 @@ budget than a queued batch task.
 | Roads (accessibility proxy) | GRIP4 Africa vectors (`sat-io/open-datasets/GRIP4/Africa`) | vector |
 | Protected areas | WDPA current polygons | vector |
 | Permanent surface water | JRC Global Surface Water `v1_4` | 30 m |
+| Geology (lithology) | User-supplied national geology map (`projects/ee-samuelaojih/assets/geology`) | vector |
 
 Layers coarser than the chosen output resolution (rainfall, PET/aridity, soils) are
 bilinearly resampled onto the output grid to avoid blocky nearest-neighbour artefacts -
@@ -71,6 +72,35 @@ static terrain metrics that can look "flood-prone" on slope/HAND alone even wher
 there is essentially no rainfall to ever generate that runoff. Erosion Control is
 deliberately not gated this way - semi-arid zones are classically the most
 erosion-prone (sparse cover + intense convective storms).
+
+## Geology
+
+The script now uses a real, locally-sourced national lithology map (a FeatureCollection
+with a `short_name` lithology code and `era` attribute) - the first non-global-proxy
+dataset in this script, and a genuinely different kind of evidence: the parent material
+everything else sits on. Three classifications are derived from `short_name` via
+`loadGeologyLayers()` and added as new criteria:
+
+- **`hydrogeology`** (Irrigation) - Basement Complex (crystalline: granite/gneiss/
+  migmatite, low primary porosity, fracture-flow groundwater only) vs sedimentary-basin
+  (Cretaceous-Quaternary, e.g. the Chad/Sokoto/Niger Delta/Benue Trough basins,
+  generally far better aquifers) - the standard hydrogeological distinction in Nigeria,
+  directly relevant to groundwater-fed irrigation feasibility.
+- **`geoErodibility`** (Erosion Control) - Nigeria's most severe documented erosion (the
+  Anambra/Imo gully systems) is specifically associated with poorly-consolidated
+  Cenozoic sedimentary formations, not the crystalline basement - a lithology-aware
+  signal complementing the existing sand-fraction-based K-factor.
+- **`geoAlluvium`** (Flood Mitigation, Wetland Restoration) - mapped Quaternary alluvium
+  is the geological, long-term-record definition of an active floodplain, independent
+  confirmation alongside `floodSeasonality`'s short satellite record.
+
+The hydrogeology/erodibility rankings are a reasoned simplification from general
+geological principles (see the exact code-to-class mappings at the `GEOLOGY`
+declaration), not a validated formation-by-formation geotechnical study - treat them as
+directionally correct, not precise. The alluvium flag rests on a more directly-grounded
+geological definition. Any lithology code in the full asset not covered by this
+mapping falls back to a documented neutral/conservative default. All four affected
+models' other weights were rescaled to still sum to 1.00.
 
 ## Flood Mitigation, and a units bug that affected four models
 

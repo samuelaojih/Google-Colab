@@ -262,11 +262,118 @@
  *          classifyPriority5()'s top-20% cut is taken from a realistically-sized candidate
  *          pool instead of the whole catchment. Other models are untouched.
  *
+ *  V11 - adds a real, user-supplied national geology layer (GEOLOGY, see below) - the first
+ *       locally-sourced (not global-proxy) dataset in this script, and a genuinely different
+ *       kind of evidence: the parent material everything else sits on top of. Three
+ *       classifications are derived from its lithology code ('short_name') via loadGeologyLayers()
+ *       and added as new criteria (full rationale + the exact code->class mappings are
+ *       documented at the GEOLOGY declaration below):
+ *         - hydrogeology (Basement Complex vs sedimentary-basin groundwater potential) -> new
+ *           criterion in Irrigation.
+ *         - geoErodibility (lithology-aware erodibility - Nigeria's worst documented erosion,
+ *           the Anambra/Imo gullies, is specifically in poorly-consolidated Cenozoic sediment,
+ *           not the crystalline basement) -> new criterion in Erosion Control.
+ *         - geoAlluvium (Quaternary alluvium = the geological, long-term-record definition of an
+ *           active floodplain) -> new criterion in Flood Mitigation AND Wetland Restoration,
+ *           independent confirmation alongside floodSeasonality's short satellite record.
+ *       All four models' other weights were rescaled so each still sums to 1.00 (verified by
+ *       script, not by hand). Reforestation and Agricultural Productivity are unchanged. The
+ *       hydrogeology/erodibility rankings are a reasoned simplification from general geological
+ *       principles, not a validated formation-by-formation study - the alluvium flag rests on a
+ *       much more directly-grounded geological definition. Any lithology code encountered in the
+ *       full asset that wasn't in this file's preview of the data falls back to a documented
+ *       neutral/conservative default rather than being guessed.
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
 
 var SCMP = ee.FeatureCollection('projects/ee-samuelaojih/assets/SCMP_SHAPEFILES');
+
+/* ---------------------------- GEOLOGY (V11) --------------------------------------------- */
+/*  A real, national-scale lithostratigraphic map (polygon features, attributes include
+ *  'short_name'/'GLG' - a lithology code like 'pCm', 'K', 'Qe' - and 'era'/'long_name'). Unlike
+ *  every other layer in this script, this is a locally-sourced geological survey product, not a
+ *  global proxy - and geology is a genuinely different kind of evidence than terrain/climate/
+ *  soil: it is the PARENT MATERIAL those all sit on top of, and Nigeria's geology has three
+ *  well-established, first-order controls this script had no way to see before:
+ *    1. Basement Complex (Precambrian crystalline: granite/gneiss/migmatite) vs Sedimentary
+ *       Basin (Cretaceous-Quaternary, e.g. the Chad, Sokoto, Niger Delta, Benue Trough basins)
+ *       terrain is THE standard hydrogeological distinction in Nigeria - crystalline basement
+ *       has low primary porosity (groundwater mostly in fractures/the weathered zone, yield
+ *       unpredictable), sedimentary basins are generally far better aquifers. Relevant to
+ *       Irrigation siting.
+ *    2. Nigeria's most severe, well-documented erosion crisis (the Anambra/Imo gully systems)
+ *       is specifically associated with poorly-consolidated Cenozoic sedimentary formations
+ *       (loose coastal-plain sands with low cohesion), not the crystalline basement - a
+ *       lithology-aware erodibility signal is a materially different, and for Nigeria more
+ *       geologically grounded, complement to the existing sand-fraction-based K-factor.
+ *    3. Quaternary alluvium (undivided/Pleistocene/Holocene) is, by definition, recent fluvial
+ *       deposition - the GEOLOGICAL record of where a river has actually built a floodplain
+ *       over geological time, independent of and complementary to floodSeasonality's short
+ *       satellite observational record and majorRiverProx/wetlandProx's proximity proxies.
+ *  The three classifications below (hydrogeology, erodibility, alluvium) are built from
+ *  'short_name' via an ee.Dictionary lookup with an explicit default for any code not in this
+ *  preview of the dataset - this file only inspected a sample of features, so the full asset
+ *  may contain lithology codes not listed here; anything unmapped falls back to a neutral/
+ *  conservative default rather than guessing. The hydrogeology/erodibility rankings are a
+ *  reasonable, general-geology-principles-based simplification (a real formation-by-formation
+ *  geotechnical erodibility or aquifer-yield study would be more precise) - treat them as a
+ *  directionally-correct signal, not a validated index. The alluvium flag is the most
+ *  confidently-grounded of the three: it rests on the basic geological definition of Quaternary
+ *  deposits, not an interpretive ranking. */
+var GEOLOGY = ee.FeatureCollection('projects/ee-samuelaojih/assets/geology');
+
+// Groundwater/aquifer potential proxy (1 = low/basement-crystalline, 2 = mixed/moderate,
+// 3 = high/sedimentary-basin or recent alluvium). Default 2 for any unmapped code.
+var HYDROGEOLOGY_CLASS_BY_CODE = ee.Dictionary({
+  'pCm': 1, 'Pz': 1, 'Mi': 1, 'Ti': 1, 'Qv': 1,           // crystalline basement / igneous-volcanic
+  'MzPz': 2, 'H2O': 2,                                     // mixed old rocks / open water (n/a)
+  'K': 3, 'Kl': 3, 'TK': 3, 'T': 3, 'Q': 3, 'Qp': 3, 'Qe': 3  // sedimentary basin / alluvium
+});
+var HYDROGEOLOGY_DEFAULT = 2;
+
+// Lithology-based erodibility proxy (1 = more resistant, 2 = moderate, 3 = highly erodible when
+// disturbed - poorly-consolidated Cenozoic sediment, the Anambra/Imo gully lithology). Default 2.
+var ERODIBILITY_CLASS_BY_CODE = ee.Dictionary({
+  'Mi': 1, 'Ti': 1, 'Qv': 1,                                // fresh igneous/volcanic rock
+  'pCm': 2, 'Pz': 2, 'MzPz': 2, 'K': 2, 'Kl': 2, 'TK': 2, 'H2O': 2,  // basement / consolidated sedimentary
+  'T': 3, 'Q': 3, 'Qp': 3, 'Qe': 3                          // unconsolidated Cenozoic sediment/alluvium
+});
+var ERODIBILITY_DEFAULT = 2;
+
+// Quaternary alluvium flag (1 = mapped as recent fluvial deposit or open water, i.e. geological
+// floodplain evidence; 0 = older/consolidated formation). Default 0 (conservative).
+var ALLUVIUM_CLASS_BY_CODE = ee.Dictionary({
+  'Q': 1, 'Qp': 1, 'Qe': 1, 'H2O': 1,
+  'pCm': 0, 'Pz': 0, 'MzPz': 0, 'Mi': 0, 'Ti': 0, 'Qv': 0, 'K': 0, 'Kl': 0, 'TK': 0, 'T': 0
+});
+var ALLUVIUM_DEFAULT = 0;
+
+// Rasterizes the three classifications above for one region. Vector-to-raster via
+// reduceToImage() (each polygon contributes its own attribute value, unlike paint()'s single
+// fixed value) at nearest-neighbour - these are categorical/ordinal classes, like WorldCover,
+// so bilinear resampling would blur meaningless intermediate values across formation
+// boundaries. unmask()'d to each class's neutral/conservative default so a gap in geology
+// coverage (the asset may not extend to every catchment) doesn't mask out an entire pixel from
+// every OTHER criterion once these bands are combined in buildNormalizedCriteria().
+function loadGeologyLayers(region) {
+  var geo = GEOLOGY.filterBounds(region).map(function(f) {
+    var code = ee.String(f.get('short_name'));
+    return f.set(
+      'hydroClass', HYDROGEOLOGY_CLASS_BY_CODE.get(code, HYDROGEOLOGY_DEFAULT),
+      'erodClass', ERODIBILITY_CLASS_BY_CODE.get(code, ERODIBILITY_DEFAULT),
+      'alluvClass', ALLUVIUM_CLASS_BY_CODE.get(code, ALLUVIUM_DEFAULT)
+    );
+  });
+  var hydrogeology = geo.reduceToImage(['hydroClass'], ee.Reducer.first())
+                       .unmask(HYDROGEOLOGY_DEFAULT).rename('hydrogeology');
+  var geoErodibility = geo.reduceToImage(['erodClass'], ee.Reducer.first())
+                         .unmask(ERODIBILITY_DEFAULT).rename('geoErodibility');
+  var geoAlluvium = geo.reduceToImage(['alluvClass'], ee.Reducer.first())
+                      .unmask(ALLUVIUM_DEFAULT).rename('geoAlluvium');
+  return {hydrogeology: hydrogeology, geoErodibility: geoErodibility, geoAlluvium: geoAlluvium};
+}
 
 /* ============================ 0. CONFIG ================================================== */
 
@@ -489,6 +596,9 @@ function criterionLayers(region) {
   var slope = ee.Terrain.slope(dem);
   var nYears = ee.Number(ee.Date(END).difference(ee.Date(START), 'year'));
 
+  // V11: geology (hydrogeology/erodibility/alluvium) - see loadGeologyLayers() above.
+  var geology = loadGeologyLayers(region);
+
   // Hydrology from the DEM. NOTE (fix G): hand/upa/twi/streams are flow-routed quantities -
   // deliberately NOT bilinearly resampled (interpolating routed hydrology between pixels can
   // manufacture false intermediate stream cells), so these keep MERIT Hydro's native handling.
@@ -663,6 +773,7 @@ function criterionLayers(region) {
     ecoCondition: ecoCondition, wetlandSignal: wetlandSignal, burnFreq: burnFreq,
     majorRiverProx: majorRiverProx, floodSeasonality: floodSeasonality, heavyRainDays: heavyRainDays,
     wetlandProx: wetlandProx,
+    hydrogeology: geology.hydrogeology, geoErodibility: geology.geoErodibility, geoAlluvium: geology.geoAlluvium,
     aridityIdx: aridityIdx, aridityZone: aridityZone,
     elevationZone: elevationZone, ecoZone: ecoZone
   };
@@ -678,17 +789,24 @@ var MODELS = {
   // strongest empirical signal this model had no way to use before. heavyRainDays (CHIRPS,
   // days/year >=20 mm) replaces plain mean annual rainfall with a flood-triggering-extremes
   // signal. See criterionLayers() for how each of these three is built.
+  // V11: geoAlluvium added - Quaternary alluvium is the geological (long-term, not just
+  // satellite-record) definition of an active floodplain, independent confirmation of
+  // floodSeasonality/majorRiverProx. Other weights rescaled to still sum to 1.00.
   'Flood Mitigation': { palette: ['#f7fbff','#9ecae1','#4292c6','#08519c','#08306b'], criteria: [
-    {c: 'hand', w: 0.16, d: '-'}, {c: 'majorRiverProx', w: 0.16, d: '-'}, {c: 'upa', w: 0.14, d: '+'},
-    {c: 'twi', w: 0.12, d: '+'}, {c: 'floodSeasonality', w: 0.18, d: '+'}, {c: 'heavyRainDays', w: 0.12, d: '+'},
-    {c: 'pop', w: 0.08, d: '+'}, {c: 'built', w: 0.04, d: '+'}
+    {c: 'hand', w: 0.14, d: '-'}, {c: 'majorRiverProx', w: 0.14, d: '-'}, {c: 'upa', w: 0.13, d: '+'},
+    {c: 'twi', w: 0.11, d: '+'}, {c: 'floodSeasonality', w: 0.16, d: '+'}, {c: 'heavyRainDays', w: 0.11, d: '+'},
+    {c: 'pop', w: 0.07, d: '+'}, {c: 'built', w: 0.04, d: '+'}, {c: 'geoAlluvium', w: 0.10, d: '+'}
   ]},
   // V9: burnFreq (MODIS MCD64A1 burned-area frequency) added as a degradation-driver criterion;
   // other weights rescaled so the model still sums to 1.00.
+  // V11: geoErodibility added - a lithology-aware erodibility signal (Nigeria's most severe
+  // documented erosion, the Anambra/Imo gully systems, is specifically associated with poorly-
+  // consolidated Cenozoic sediment, not the crystalline basement), complementing the sand-
+  // fraction-based kfactor. Other weights rescaled to still sum to 1.00.
   'Erosion Control': { palette: ['#ffffcc','#fed976','#fd8d3c','#e31a1c','#800026'], criteria: [
-    {c: 'slope', w: 0.23, d: '+'}, {c: 'kfactor', w: 0.18, d: '+'}, {c: 'rainfall', w: 0.16, d: '+'},
-    {c: 'drainageDensity', w: 0.13, d: '+'}, {c: 'ndviDegrade', w: 0.10, d: '+'}, {c: 'burnFreq', w: 0.10, d: '+'},
-    {c: 'ecoPressure', w: 0.06, d: '+'}, {c: 'builtPressure', w: 0.04, d: '+'}
+    {c: 'slope', w: 0.21, d: '+'}, {c: 'kfactor', w: 0.16, d: '+'}, {c: 'rainfall', w: 0.14, d: '+'},
+    {c: 'drainageDensity', w: 0.12, d: '+'}, {c: 'ndviDegrade', w: 0.09, d: '+'}, {c: 'burnFreq', w: 0.09, d: '+'},
+    {c: 'ecoPressure', w: 0.05, d: '+'}, {c: 'builtPressure', w: 0.04, d: '+'}, {c: 'geoErodibility', w: 0.10, d: '+'}
   ]},
   'Reforestation': { palette: ['#ffffe5','#d9f0a3','#78c679','#238443','#004529'], criteria: [
     {c: 'ndviDeficit', w: 0.18, d: '+'}, {c: 'natvegDeficit', w: 0.16, d: '+'},
@@ -696,10 +814,14 @@ var MODELS = {
     {c: 'slope', w: 0.09, d: '+'}, {c: 'roadAccess', w: 0.05, d: '+'}, {c: 'ecoPressure', w: 0.05, d: '+'},
     {c: 'burnFreq', w: 0.08, d: '+'}
   ]},
+  // V11: hydrogeology added - Basement Complex vs sedimentary-basin terrain is the standard
+  // groundwater-potential distinction in Nigeria, directly relevant to irrigation feasibility
+  // (especially borehole/groundwater-fed schemes) in a way none of the other criteria capture.
+  // Other weights rescaled to still sum to 1.00.
   'Irrigation': { palette: ['#f7fcfd','#bfd3e6','#8c96c6','#88419d','#4d004b'], criteria: [
-    {c: 'awc', w: 0.22, d: '+'}, {c: 'slope', w: 0.18, d: '-'}, {c: 'roadAccess', w: 0.15, d: '+'},
-    {c: 'rainfall', w: 0.14, d: '-'}, {c: 'ndvi', w: 0.12, d: '+'}, {c: 'pop', w: 0.10, d: '+'},
-    {c: 'drainageProx', w: 0.09, d: '-'}
+    {c: 'awc', w: 0.19, d: '+'}, {c: 'slope', w: 0.16, d: '-'}, {c: 'roadAccess', w: 0.13, d: '+'},
+    {c: 'rainfall', w: 0.12, d: '-'}, {c: 'ndvi', w: 0.11, d: '+'}, {c: 'pop', w: 0.09, d: '+'},
+    {c: 'drainageProx', w: 0.08, d: '-'}, {c: 'hydrogeology', w: 0.12, d: '+'}
   ]},
   'Agricultural Productivity': { palette: ['#ffffe5','#f7fcb9','#addd8e','#41ab5d','#005a32'], criteria: [
     {c: 'ndvi', w: 0.18, d: '+'}, {c: 'ndviCond', w: 0.16, d: '+'}, {c: 'rainfall', w: 0.16, d: '+'},
@@ -712,10 +834,13 @@ var MODELS = {
   // criterionLayers() and the additional hard eligibility gate in weightedComposite() below -
   // both address the same root cause: this model's "very high priority" area coming out far
   // larger than real wetland/floodplain extent in most catchments.
+  // V11: geoAlluvium added - same rationale as Flood Mitigation (Quaternary alluvium is the
+  // geological definition of a floodplain/wetland substrate). Other weights rescaled to still
+  // sum to 1.00.
   'Wetland Restoration': { palette: ['#f7fcf0','#ccebc5','#7bccc4','#2b8cbe','#084081'], criteria: [
-    {c: 'wetlandProx', w: 0.20, d: '-'}, {c: 'twi', w: 0.18, d: '+'}, {c: 'permWater', w: 0.16, d: '+'},
-    {c: 'ndwi', w: 0.14, d: '+'}, {c: 'hand', w: 0.12, d: '-'}, {c: 'rainfall', w: 0.10, d: '+'},
-    {c: 'ecoCondition', w: 0.06, d: '+'}, {c: 'wetlandSignal', w: 0.04, d: '+'}
+    {c: 'wetlandProx', w: 0.18, d: '-'}, {c: 'twi', w: 0.17, d: '+'}, {c: 'permWater', w: 0.15, d: '+'},
+    {c: 'ndwi', w: 0.13, d: '+'}, {c: 'hand', w: 0.11, d: '-'}, {c: 'rainfall', w: 0.09, d: '+'},
+    {c: 'ecoCondition', w: 0.05, d: '+'}, {c: 'wetlandSignal', w: 0.04, d: '+'}, {c: 'geoAlluvium', w: 0.08, d: '+'}
   ]}
 };
 var MODEL_NAMES = ['Flood Mitigation', 'Erosion Control', 'Reforestation', 'Irrigation',
@@ -1368,7 +1493,11 @@ infoPanel.add(ui.Label(
   'floodSeasonality (JRC seasonality band - actual historical months/year a pixel is observed ' +
   'flooded, not just a terrain proxy), and heavyRainDays (CHIRPS days/year >=20 mm) in place of ' +
   'mean annual rainfall - tuned for big-river floodplain catchments (e.g. Benue-Mada) rather ' +
-  'than small-stream flash flooding alone.',
+  'than small-stream flash flooding alone. Geology (a real national lithology map, not a ' +
+  'global proxy) adds hydrogeology (Basement Complex vs sedimentary-basin groundwater ' +
+  'potential) to Irrigation, geoErodibility (lithology-aware erosion susceptibility) to ' +
+  'Erosion Control, and geoAlluvium (mapped Quaternary alluvium - the geological definition ' +
+  'of a floodplain) to Flood Mitigation and Wetland Restoration.',
   {fontSize: '10px', color: '#555', margin: '2px 4px'}));
 infoToggleBtn.onClick(function() { infoPanel.style().set('shown', !infoPanel.style().get('shown')); });
 
@@ -1553,6 +1682,14 @@ function runWithScale(sel) {
     'Aridity zone (1=hyper-arid ... 5=humid)', false);
   map.addLayer(layers.elevationZone, {min: 1, max: 3, palette: ELEVATION_ZONE_PALETTE},
     'Elevation zone (1=lowland, 2=upland, 3=montane)', false);
+  // V11: geology context layers - off by default, toggle to inspect/sanity-check against the
+  // source geology map.
+  map.addLayer(layers.hydrogeology, {min: 1, max: 3, palette: ['#d7301f', '#fdcc8a', '#2b8cbe']},
+    'Hydrogeology (1=basement/low, 2=mixed, 3=sedimentary-basin/high)', false);
+  map.addLayer(layers.geoErodibility, {min: 1, max: 3, palette: ['#1a9850', '#fee08b', '#d73027']},
+    'Geological erodibility (1=resistant, 2=moderate, 3=unconsolidated/highly erodible)', false);
+  map.addLayer(layers.geoAlluvium.selfMask(), {min: 1, max: 1, palette: ['#2166ac']},
+    'Mapped Quaternary alluvium (geological floodplain)', false);
 
   map.addLayer(priorityClass, {min: 1, max: 5, palette: pal}, modelName + ' priority class (1-5)');
   map.addLayer(ee.Image().byte().paint(sel.boundary, 1, 2),
