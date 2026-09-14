@@ -103,6 +103,29 @@ On top of that fix, **Flood Mitigation is redesigned for big-river/floodplain fl
 
 Other models' criteria are unchanged apart from the units bug fix above.
 
+## Wetland Restoration area was overstated
+
+Two compounding causes made Wetland Restoration's "very high priority" (class 5) area
+come out far larger than real wetland/floodplain extent in most catchments:
+
+1. `classifyPriority5()` ranks pixels by **quantile** (20/40/60/80th percentile), so
+   class 5 is always the top 20% of *whatever pool of pixels it's given* - a relative
+   rank, not an absolute "this is genuinely wetland-suitable" threshold. Wetlands are
+   inherently rare on the landscape, so ranking the entire catchment and taking the top
+   20% systematically overstates area for a rare-suitability theme like this one.
+2. The units bug fix above made `drainageProx` (distance to the nearest >1 km² channel)
+   finally work as intended everywhere it's used - but for Wetland Restoration that's
+   the *wrong* proximity signal: a steep highland headwater also clears 1 km², so
+   "close to some stream" ends up true across most of a catchment.
+
+Fix, addressing both: `wetlandProx` replaces `drainageProx` for this model - distance
+to actual wetland *evidence* (JRC permanent water, WorldCover wetland/mangrove, or any
+JRC-observed seasonal flooding) rather than to any qualifying stream. A hard
+eligibility gate then masks out anything beyond `WETLAND_ELIGIBLE_KM` (10 km) of that
+same evidence *before* classification, so the top-20% cut is taken from a
+realistically-sized candidate pool instead of the whole catchment. Other models are
+unaffected.
+
 ## Analysis add-ons
 
 - **Shared exclusion mask.** No model recommends siting on built-up land or open

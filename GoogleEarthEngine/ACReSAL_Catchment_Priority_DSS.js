@@ -237,6 +237,31 @@
  *      Other models' criteria (drainageProx, plain rainfall, etc.) are unchanged apart from the
  *      units bug fix above.
  *
+ *  V10.1 - fixes Wetland Restoration's "very high priority" area coming out far larger than
+ *       real wetland/floodplain extent for most catchments. Two compounding causes:
+ *
+ *   1) classifyPriority5() ranks pixels by QUANTILE (20/40/60/80th percentile), so class 5 is
+ *      always exactly the top 20% of whatever pool of pixels it's given - a RELATIVE rank, not
+ *      an absolute "this is genuinely wetland-suitable" threshold. That is fine for a theme
+ *      whose suitable land occupies a "normal" share of a typical catchment, but wetlands are
+ *      inherently rare on the landscape - ranking the ENTIRE catchment and taking the top 20%
+ *      systematically overstates area for a rare-suitability theme like this one.
+ *   2) The V10 units fix (see above) made drainageProx (distance to the nearest >1 km2 channel)
+ *      finally work as intended everywhere it's used - but for Wetland Restoration specifically
+ *      that is the WRONG proximity signal: a steep highland headwater or gully-forming
+ *      tributary also clears 1 km2, so "close to some stream" ends up true across most of a
+ *      catchment, feeding a weakly-discriminating "+" signal into 20% of this model's weight.
+ *
+ *      Fix, both aimed at the same root cause:
+ *        - wetlandProx replaces drainageProx for this model: distance to actual wetland
+ *          EVIDENCE (JRC permanent water, WorldCover wetland/mangrove, or any JRC-observed
+ *          seasonal flooding at all) rather than to any qualifying stream - rarer, and a much
+ *          better proxy for "restorable wetland."
+ *        - A hard eligibility gate in weightedComposite() masks out anything beyond
+ *          WETLAND_ELIGIBLE_KM (10 km) of that same wetland evidence BEFORE classification, so
+ *          classifyPriority5()'s top-20% cut is taken from a realistically-sized candidate
+ *          pool instead of the whole catchment. Other models are untouched.
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
@@ -256,6 +281,7 @@ var RESOLUTION_OPTIONS_M = [50, 60, 100];           // user-selectable output re
 var STATS_SCALE_FLOOR = 250;                        // metres - floor for scalar-summary reduceRegion calls (see statsScale())
 var MAJOR_RIVER_UPA_KM2 = 500;                      // km^2 upstream area cutoff for a "major river" (V10, Flood Mitigation)
 var HEAVY_RAIN_MM_DAY = 20;                         // mm/day - ETCCDI-style "very heavy rain day" threshold (V10, Flood Mitigation)
+var WETLAND_ELIGIBLE_KM = 10;                       // km - hard eligibility radius from wetland evidence (V10.1, Wetland Restoration)
 
 // Every reduceRegion()/histogram call in this script computes a SCALAR summary only
 // (percentile stretch bounds, classification thresholds, per-zone thresholds, area totals) -
@@ -576,6 +602,23 @@ function criterionLayers(region) {
   var natvegDeficit = natveg.not().rename('natvegDeficit');
   var wetlandSignal = wc.eq(90).or(wc.eq(95)).rename('wetlandSignal');
 
+  // V10.1: wetland-specific proximity, replacing drainageProx for the Wetland Restoration model.
+  // Problem: after the V10 units fix, drainageProx (distance to the nearest >1 km2 channel)
+  // finally works as intended - but for Wetland Restoration specifically that is the WRONG
+  // proximity signal. Every steep highland headwater and gully-forming tributary also clears
+  // 1 km2, so "close to some stream" is true across most of a typical catchment, including land
+  // with nothing to do with wetlands. That flooded Wetland Restoration's composite with a
+  // widely-true, weakly-discriminating "+" signal at 20% weight, which - combined with
+  // classifyPriority5()'s quantile classification always carving out the top 20% of pixels as
+  // class 5 REGARDLESS of how much of the catchment is genuinely wetland-like - produced a much
+  // larger "very high priority" footprint than real wetland/floodplain extent in the catchment.
+  // wetlandProx instead measures distance to actual wetland EVIDENCE (JRC permanent water,
+  // WorldCover wetland/mangrove, or any JRC-observed seasonal flooding at all) - land that is
+  // rarer, and a materially better proxy for "restorable wetland" than generic stream proximity.
+  var wetlandEvidence = permWater.or(wetlandSignal).or(floodSeasonality.gt(0));
+  var wetlandProx = wetlandEvidence.fastDistanceTransform(searchRadiusPixels(30), 'pixels').sqrt()
+                      .multiply(ee.Image.pixelArea().sqrt()).rename('wetlandProx');
+
   // Population (Meta/CIESIN High Resolution Settlement Layer, ~30 m - finer than every output
   // resolution offered).
   var pop = ee.ImageCollection('projects/sat-io/open-datasets/hrsl/hrslpop')
@@ -619,6 +662,7 @@ function criterionLayers(region) {
     ph: ph, cropland: cropland, ndwi: ndwi, permWater: permWater,
     ecoCondition: ecoCondition, wetlandSignal: wetlandSignal, burnFreq: burnFreq,
     majorRiverProx: majorRiverProx, floodSeasonality: floodSeasonality, heavyRainDays: heavyRainDays,
+    wetlandProx: wetlandProx,
     aridityIdx: aridityIdx, aridityZone: aridityZone,
     elevationZone: elevationZone, ecoZone: ecoZone
   };
@@ -662,8 +706,14 @@ var MODELS = {
     {c: 'ph', w: 0.14, d: '+'}, {c: 'soc', w: 0.14, d: '+'}, {c: 'awc', w: 0.12, d: '+'},
     {c: 'cropland', w: 0.06, d: '+'}, {c: 'roadAccess', w: 0.04, d: '+'}
   ]},
+  // V10.1: drainageProx (distance to ANY >1 km2 channel, including highland headwaters that
+  // have nothing to do with wetlands) replaced by wetlandProx (distance to actual wetland
+  // evidence - permanent/seasonal water or WorldCover wetland/mangrove). See wetlandProx in
+  // criterionLayers() and the additional hard eligibility gate in weightedComposite() below -
+  // both address the same root cause: this model's "very high priority" area coming out far
+  // larger than real wetland/floodplain extent in most catchments.
   'Wetland Restoration': { palette: ['#f7fcf0','#ccebc5','#7bccc4','#2b8cbe','#084081'], criteria: [
-    {c: 'drainageProx', w: 0.20, d: '-'}, {c: 'twi', w: 0.18, d: '+'}, {c: 'permWater', w: 0.16, d: '+'},
+    {c: 'wetlandProx', w: 0.20, d: '-'}, {c: 'twi', w: 0.18, d: '+'}, {c: 'permWater', w: 0.16, d: '+'},
     {c: 'ndwi', w: 0.14, d: '+'}, {c: 'hand', w: 0.12, d: '-'}, {c: 'rainfall', w: 0.10, d: '+'},
     {c: 'ecoCondition', w: 0.06, d: '+'}, {c: 'wetlandSignal', w: 0.04, d: '+'}
   ]}
@@ -850,6 +900,19 @@ function weightedComposite(modelName, region, layers, normImg, weightOverrides) 
   var gate = climateGateFactor(modelName, layers.aridityZone);
   if (gate) { surface = surface.multiply(gate).rename('priority'); }
   surface = surface.updateMask(exclusionMask(modelName, region));
+
+  // V10.1: hard eligibility gate for Wetland Restoration, on top of the wetlandProx criterion
+  // swap above. classifyPriority5() always carves the top 20% of whatever pixels reach it into
+  // class 5 - a quantile rank is relative, not absolute, so if the model ranks the WHOLE
+  // catchment (including land with no realistic wetland potential at all), "class 5" ends up
+  // meaning "the most wetland-like 20% of a mostly non-wetland catchment," not "genuinely
+  // restorable wetland." Masking out anything beyond WETLAND_ELIGIBLE_KM of actual wetland
+  // evidence BEFORE classification shrinks the pool classifyPriority5() ranks down to a
+  // realistically-sized candidate area, so its top-20% cut lands on a much more sensible
+  // absolute footprint instead of 20% of the entire catchment.
+  if (modelName === 'Wetland Restoration') {
+    surface = surface.updateMask(layers.wetlandProx.lte(WETLAND_ELIGIBLE_KM * 1000));
+  }
   return surface;
 }
 
