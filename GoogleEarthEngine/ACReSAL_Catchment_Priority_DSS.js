@@ -284,6 +284,29 @@
  *       full asset that wasn't in this file's preview of the data falls back to a documented
  *       neutral/conservative default rather than being guessed.
  *
+ *  V11.1 - fixes rectangular "Not Suitable" blocks with perfectly straight edges appearing in
+ *       Erosion Control and Reforestation output (reported for a Nigeria-scale run) - the
+ *       classic signature of a missing-data tile in a source raster, not a real field result.
+ *       Root cause: buildNormalizedCriteria() never unmasked a standardized criterion band, so
+ *       wherever a SOURCE dataset has a genuine data gap (tiled products like MODIS MCD64A1 -
+ *       used by burnFreq, shared by both affected models - and Sentinel-2 can have real
+ *       no-data footprints, often rectangular because they're aligned to the sensor's own tile
+ *       grid), that ONE masked criterion stayed masked all the way into weightedComposite()'s
+ *       running sum. ee.Image.add() propagates masking - once any single criterion in the sum
+ *       is masked at a pixel, the WHOLE composite goes masked there, discarding every other
+ *       criterion's perfectly valid data too. (Erosion Control and Reforestation share exactly
+ *       four criteria - rainfall, slope, ecoPressure, burnFreq - any one of which having a
+ *       source-data gap would reproduce the identical footprint in both models, matching what
+ *       was reported.) Fixed with NEUTRAL_CRITERION_VALUE: every standardized criterion band is
+ *       now unmasked to a neutral 0.5 midpoint (contributing neither for nor against) rather
+ *       than left masked (discarding the whole pixel) or defaulting to 0 (which would silently
+ *       read as "worst possible" for every criterion). Also hardened the three places WorldCover
+ *       is loaded (criterionLayers(), exclusionMask(), buildThemes()) with unmask(0) - 0 is not
+ *       a valid WorldCover class, so a genuine coverage gap there now safely reads as "none of
+ *       the classes below" instead of propagating a mask through .eq()/.or() chains into
+ *       ecoPressure, wetlandSignal, natvegDeficit, and the exclusion mask's built-up test
+ *       (where a masked eligibility value would otherwise silently exclude viable land).
+ *
  *  (Carried over from the earlier timeout fix: batch Export.image.toDrive tasks for large
  *  catchments, simplified WDPA polygons, and tileScale on heavy reduceRegion calls.)
  **********************************************************************************************/
@@ -389,6 +412,22 @@ var STATS_SCALE_FLOOR = 250;                        // metres - floor for scalar
 var MAJOR_RIVER_UPA_KM2 = 500;                      // km^2 upstream area cutoff for a "major river" (V10, Flood Mitigation)
 var HEAVY_RAIN_MM_DAY = 20;                         // mm/day - ETCCDI-style "very heavy rain day" threshold (V10, Flood Mitigation)
 var WETLAND_ELIGIBLE_KM = 10;                       // km - hard eligibility radius from wetland evidence (V10.1, Wetland Restoration)
+
+// V11.1: neutral fallback for a standardized (0-1) criterion band wherever its SOURCE data has
+// a genuine gap (a tiled product like MODIS or Sentinel-2 can have real no-data footprints,
+// often perfectly rectangular - aligned to the sensor's own tile grid - which is the tell that
+// distinguishes a data gap from an actual field result). Previously such a gap stayed masked
+// through applyStretch() into buildNormalizedCriteria()'s output, and ee.Image.add() propagates
+// masking: weightedComposite()'s running sum (acc.add(...)) went masked from that criterion
+// onward for that pixel, discarding EVERY OTHER criterion's perfectly valid data there too -
+// visible as a rectangular "hole" that, once exported/rendered without its NoData flag
+// surviving intact, can render as a solid, spurious low-value block rather than a transparent
+// gap. 0.5 (the midpoint of the standardized scale) means "this one criterion contributes
+// neither for nor against" rather than the wrong alternatives: leaving the pixel masked
+// (discarding every other criterion too) or defaulting to 0 (which - since direction correction
+// is already baked into applyStretch's output - would silently read as "worst possible" for
+// every criterion regardless of its original benefit/cost direction).
+var NEUTRAL_CRITERION_VALUE = 0.5;
 
 // Every reduceRegion()/histogram call in this script computes a SCALAR summary only
 // (percentile stretch bounds, classification thresholds, per-zone thresholds, area totals) -
@@ -705,7 +744,12 @@ function criterionLayers(region) {
 
   // Land cover (ESA WorldCover v200, 10 m - already finer than every output resolution offered,
   // so no resample needed; categorical, must stay nearest-neighbour in any case).
-  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
+  // V11.1: unmask(0) - 0 is not a valid WorldCover class (real classes are 10-100), so any
+  // genuine coverage gap safely reads as "none of the classes below" for every boolean derived
+  // from wc, instead of propagating a mask through .eq()/.or() chains into ecoPressure,
+  // wetlandSignal, natvegDeficit, etc. (see NEUTRAL_CRITERION_VALUE for the matching fix on the
+  // continuous criteria).
+  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic().unmask(0);
   var built    = wc.eq(50).rename('built');
   var cropland = wc.eq(40).rename('cropland');
   var natveg   = wc.eq(10).or(wc.eq(20)).or(wc.eq(30));
@@ -918,7 +962,11 @@ var EXCLUDE_WDPA_FOR = {'Agricultural Productivity': 1, 'Irrigation': 1};
 var EXISTING_INTERVENTIONS_ASSET = '';
 
 function exclusionMask(modelName, region) {
-  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
+  // V11.1: unmask(0) - see the matching fix in criterionLayers(). Without it, a genuine
+  // WorldCover coverage gap would make builtUp masked rather than False at that pixel, and
+  // since updateMask() treats a masked ELIGIBILITY value as "exclude," a data gap here would
+  // silently exclude perfectly viable land instead of defaulting to eligible.
+  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic().unmask(0);
   var builtUp = wc.eq(50);
   var permWater = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence').unmask(0).gte(50);
   var exclude = builtUp.or(permWater);
@@ -959,7 +1007,9 @@ function buildNormalizedCriteria(modelName, region, layers) {
       var band = layers[cr.c].rename(cr.c).toFloat();
       var lo = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p2'), globalPct.get(cr.c + '_p2'), 0));
       var hi = ee.Number(ee.Algorithms.If(globalPct.contains(cr.c + '_p98'), globalPct.get(cr.c + '_p98'), 0));
-      bands[cr.c] = applyStretch(band, cr.d, lo, hi).rename(cr.c);
+      // V11.1 fix (see NEUTRAL_CRITERION_VALUE below): unmask to a neutral midpoint instead of
+      // leaving a genuine source-data gap masked.
+      bands[cr.c] = applyStretch(band, cr.d, lo, hi).unmask(NEUTRAL_CRITERION_VALUE).rename(cr.c);
     });
   }
 
@@ -998,7 +1048,11 @@ function buildNormalizedCriteria(modelName, region, layers) {
         var mask = layers.ecoZone.eq(z);
         return ee.Image(prevImg).where(mask, s.unmask(ee.Image(prevImg)));
       }, ee.Image(0).toFloat()));
-      bands[cr.c] = ee.Image(stretched).updateMask(band.mask()).rename(cr.c);
+      // V11.1 fix: same neutral-midpoint unmask as the global-criteria path above, applied
+      // AFTER the ecozone-conditional masking this path already does for its own purposes
+      // (restricting each zone's stretch to that zone) - a genuine source-data gap in `band`
+      // still needs a neutral fallback, not to stay masked.
+      bands[cr.c] = ee.Image(stretched).updateMask(band.mask()).unmask(NEUTRAL_CRITERION_VALUE).rename(cr.c);
     });
   }
 
@@ -1118,7 +1172,8 @@ var CLUSTER_PALETTE = CLUSTERS.map(function(c) { return c.color; });
 
 // Boolean theme masks within a region.
 function buildThemes(region) {
-  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic();
+  // V11.1: unmask(0) - see the matching fix in criterionLayers()/exclusionMask().
+  var wc = ee.ImageCollection('ESA/WorldCover/v200').filterBounds(region).mosaic().unmask(0);
   // V7: Sentinel-2 NDVI (10-20 m) replaces MODIS (250 m), matching the live AHP path (fix E).
   var ndviMean = s2NdviMedian(region).rename('NDVI');
 

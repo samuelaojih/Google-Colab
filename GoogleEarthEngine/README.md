@@ -51,6 +51,26 @@ capture them). Flow-routed hydrology (HAND/upstream-area/TWI/streams) is deliber
 **not** resampled this way, since interpolating routed values between pixels can
 manufacture false intermediate stream cells.
 
+## Rectangular "Not Suitable" blocks (missing-data tiles)
+
+If a classified output shows a perfectly rectangular block of one class cutting across
+otherwise-continuous terrain, that's a missing-data tile in a source raster, not a real
+field result - real suitability doesn't follow straight lines. This was reported for
+Erosion Control and Reforestation, which share exactly four criteria: `rainfall`,
+`slope`, `ecoPressure`, and `burnFreq`. Tiled products like MODIS MCD64A1 (`burnFreq`)
+and Sentinel-2 can have genuine no-data footprints aligned to the sensor's own tile
+grid - and previously, `buildNormalizedCriteria()` never unmasked a standardized
+criterion band, so a single masked criterion propagated (`ee.Image.add()` masks its
+whole running sum once any one operand is masked) into a fully masked composite,
+discarding every other criterion's valid data at that pixel too.
+
+Fixed: every standardized criterion band is now unmasked to a neutral midpoint
+(`NEUTRAL_CRITERION_VALUE = 0.5` - contributing neither for nor against) instead of
+staying masked or defaulting to 0 (which would silently read as "worst possible").
+WorldCover loading is also hardened with `unmask(0)` (0 is not a valid WorldCover
+class), so a coverage gap there can't propagate into `ecoPressure`, `wetlandSignal`,
+`natvegDeficit`, or silently exclude viable land via the exclusion mask.
+
 ## Agro-ecological zone awareness
 
 Many ACReSAL catchments straddle several ecozones - hyper-arid/arid Sahel in the
