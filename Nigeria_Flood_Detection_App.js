@@ -1105,6 +1105,16 @@ var Button_Generate_flood = ui.Button({
 
 
     ////////////////////////////// Sentinel-2 MNDWI ///////////////////////////////
+    // NOTE: Nigeria's rainy season (roughly April-October, most severe over the
+    // Niger Delta / coastal states) frequently leaves ZERO Sentinel-2 or Landsat
+    // scenes under the CLOUD_FILTER threshold for a given AOI + date window - a
+    // situation the original US-focused script never guarded against because a
+    // full CONUS state almost always had at least one clear scene. An empty
+    // ImageCollection reduces to a 0-band image, and calling .unmask(constant) on
+    // a 0-band image throws "Image.unmask: ... Got 0 and 1." So every optical
+    // reducer below is now gated on collection size, falling back to the same
+    // safe sentinel constants used elsewhere in this script (9999 for MNDWI,
+    // -9999 for NIR) when no cloud-free imagery is available.
 
     s2Col_preEvent = get_s2_sr_cloudMask_col (before_start_date, before_end_date, AOI);
     var s2_mndwiCol_preEvent = s2Col_preEvent.map(function(img) {
@@ -1112,9 +1122,16 @@ var Button_Generate_flood = ui.Button({
       var swir1 = img.select(['B11']);
       return green.subtract(swir1).divide(green.add(swir1)).rename('MNDWI');
     });
-    s2_mndwi_Xu_preEvent = s2_mndwiCol_preEvent.median().rename('mndwi');
-    s2_b8_preEvent = get_s2_sr_cloudMask_col (before_start_date, before_end_date, AOI).select('B8').median().rename('nir');
-    s2_b8_preEvent_unmasked = s2_b8_preEvent.unmask(-9999).rename('nir');
+    if (s2Col_preEvent.size().getInfo() > 0) {
+      s2_mndwi_Xu_preEvent = s2_mndwiCol_preEvent.median().rename('mndwi');
+      s2_b8_preEvent = s2Col_preEvent.select('B8').median().rename('nir');
+      s2_b8_preEvent_unmasked = s2_b8_preEvent.unmask(-9999).rename('nir');
+    } else {
+      print('No cloud-free Sentinel-2 pre-event images for this AOI/date range; skipping S2 pre-event MNDWI/NIR.');
+      s2_mndwi_Xu_preEvent = dem.multiply(0).add(9999).rename('mndwi');
+      s2_b8_preEvent = dem.multiply(0).add(-9999).rename('nir');
+      s2_b8_preEvent_unmasked = s2_b8_preEvent;
+    }
 
 
     s2Col_postEvent = get_s2_sr_cloudMask_col (after_start_date, after_end_date, AOI);
@@ -1123,12 +1140,17 @@ var Button_Generate_flood = ui.Button({
       var swir1 = img.select(['B11']);
       return green.subtract(swir1).divide(green.add(swir1)).rename('MNDWI');
     });
-    s2_mndwi_Xu_postEvent = s2_mndwiCol_postEvent.max().rename('mndwi');
+    if (s2Col_postEvent.size().getInfo() > 0) {
+      s2_mndwi_Xu_postEvent = s2_mndwiCol_postEvent.max().rename('mndwi');
+      s2_b8_postEvent = s2Col_postEvent.select('B8').median().rename('nir');
+      s2_b8_postEvent_unmasked = s2_b8_postEvent.unmask(-9999).rename('nir');
+    } else {
+      print('No cloud-free Sentinel-2 post-event images for this AOI/date range; skipping S2 post-event MNDWI/NIR.');
+      s2_mndwi_Xu_postEvent = dem.multiply(0).add(9999).rename('mndwi');
+      s2_b8_postEvent = dem.multiply(0).add(-9999).rename('nir');
+      s2_b8_postEvent_unmasked = s2_b8_postEvent;
+    }
     print('s2_mndwi_Xu_postEvent', s2_mndwi_Xu_postEvent);
-
-    s2_b8_postEvent = get_s2_sr_cloudMask_col (after_start_date, after_end_date, AOI).select('B8').median().rename('nir');
-    print('s2_b8_postEvent_unmasked', s2_b8_postEvent_unmasked)
-    s2_b8_postEvent_unmasked = s2_b8_postEvent.unmask(-9999).rename('nir');
 
 
     ////////////////////////////// Landsat 8 and 9 MNDWI ///////////////////////////////
@@ -1139,9 +1161,16 @@ var Button_Generate_flood = ui.Button({
       var swir1 = img.select(['SR_B6']);
       return green.subtract(swir1).divide(green.add(swir1)).rename('MNDWI');
     });
-    l89_mndwi_Xu_preEvent = l89_mndwiCol_preEvent.median().rename('mndwi');
-    l89_b5_preEvent = get_l89_sr_cloudMask_col (before_start_date, before_end_date, AOI).select('SR_B5').median().rename('nir');
-    l89_b5_preEvent_unmasked = l89_b5_preEvent.unmask(-9999).rename('nir');
+    if (l89Col_preEvent.size().getInfo() > 0) {
+      l89_mndwi_Xu_preEvent = l89_mndwiCol_preEvent.median().rename('mndwi');
+      l89_b5_preEvent = l89Col_preEvent.select('SR_B5').median().rename('nir');
+      l89_b5_preEvent_unmasked = l89_b5_preEvent.unmask(-9999).rename('nir');
+    } else {
+      print('No cloud-free Landsat 8/9 pre-event images for this AOI/date range; skipping L8/9 pre-event MNDWI/NIR.');
+      l89_mndwi_Xu_preEvent = dem.multiply(0).add(9999).rename('mndwi');
+      l89_b5_preEvent = dem.multiply(0).add(-9999).rename('nir');
+      l89_b5_preEvent_unmasked = l89_b5_preEvent;
+    }
 
     l89Col_postEvent = get_l89_sr_cloudMask_col (after_start_date, after_end_date, AOI);
     var l89_mndwiCol_postEvent = l89Col_postEvent.map(function(img) {
@@ -1150,24 +1179,41 @@ var Button_Generate_flood = ui.Button({
       return green.subtract(swir1).divide(green.add(swir1)).rename('MNDWI');
     });
     print('Landsat 8&9 merged MNDWI postEvent collection', l89_mndwiCol_postEvent);
-    l89_mndwi_Xu_postEvent = l89_mndwiCol_postEvent.max().rename('mndwi');
-    l89_b5_postEvent = get_l89_sr_cloudMask_col (after_start_date, after_end_date, AOI).select('SR_B5').median().rename('nir');
-    l89_b5_postEvent_unmasked = l89_b5_postEvent.unmask(-9999).rename('nir');
+    if (l89Col_postEvent.size().getInfo() > 0) {
+      l89_mndwi_Xu_postEvent = l89_mndwiCol_postEvent.max().rename('mndwi');
+      l89_b5_postEvent = l89Col_postEvent.select('SR_B5').median().rename('nir');
+      l89_b5_postEvent_unmasked = l89_b5_postEvent.unmask(-9999).rename('nir');
+    } else {
+      print('No cloud-free Landsat 8/9 post-event images for this AOI/date range; skipping L8/9 post-event MNDWI/NIR.');
+      l89_mndwi_Xu_postEvent = dem.multiply(0).add(9999).rename('mndwi');
+      l89_b5_postEvent = dem.multiply(0).add(-9999).rename('nir');
+      l89_b5_postEvent_unmasked = l89_b5_postEvent;
+    }
     print('l89_b5_postEvent_unmasked', l89_b5_postEvent_unmasked)
 
 
     ////////////////////////////// Multi-sensor MNDWI derived from Sentinel-2, Landsat 8 and 9 MNDWI ///////////////////////////////
     multiSensor_mndwi_Xu_preEvent_Col = s2_mndwiCol_preEvent.merge(l89_mndwiCol_preEvent);
-    multiSensor_mndwi_Xu_preEvent = multiSensor_mndwi_Xu_preEvent_Col.median().rename('mndwi');
-    multiSensor_mndwi_Xu_preEvent_unmasked = multiSensor_mndwi_Xu_preEvent.unmask(9999);
+    if (multiSensor_mndwi_Xu_preEvent_Col.size().getInfo() > 0) {
+      multiSensor_mndwi_Xu_preEvent = multiSensor_mndwi_Xu_preEvent_Col.median().rename('mndwi');
+      multiSensor_mndwi_Xu_preEvent_unmasked = multiSensor_mndwi_Xu_preEvent.unmask(9999);
+    } else {
+      multiSensor_mndwi_Xu_preEvent = dem.multiply(0).add(9999).rename('mndwi');
+      multiSensor_mndwi_Xu_preEvent_unmasked = multiSensor_mndwi_Xu_preEvent;
+    }
 
-    multiSensor_nir_preEvent = ee.ImageCollection(s2_b8_preEvent).merge(ee.ImageCollection(l89_b5_preEvent)).median().rename('nir');
+    multiSensor_nir_preEvent = ee.ImageCollection([s2_b8_preEvent, l89_b5_preEvent]).median().rename('nir');
     print('multiSensor_nir_preEvent', multiSensor_nir_preEvent)
 
     multiSensor_mndwi_Xu_postEvent_Col = s2_mndwiCol_postEvent.merge(l89_mndwiCol_postEvent);
-    multiSensor_mndwi_Xu_postEvent = multiSensor_mndwi_Xu_postEvent_Col.max().rename('mndwi');
     print('MultiSensor postEvent MNDWI Col', multiSensor_mndwi_Xu_postEvent_Col);
-    multiSensor_mndwi_Xu_postEvent_unmasked = multiSensor_mndwi_Xu_postEvent.unmask(9999);
+    if (multiSensor_mndwi_Xu_postEvent_Col.size().getInfo() > 0) {
+      multiSensor_mndwi_Xu_postEvent = multiSensor_mndwi_Xu_postEvent_Col.max().rename('mndwi');
+      multiSensor_mndwi_Xu_postEvent_unmasked = multiSensor_mndwi_Xu_postEvent.unmask(9999);
+    } else {
+      multiSensor_mndwi_Xu_postEvent = dem.multiply(0).add(9999).rename('mndwi');
+      multiSensor_mndwi_Xu_postEvent_unmasked = multiSensor_mndwi_Xu_postEvent;
+    }
 
 
     if ((sentinel1Col(after_start_date, after_end_date, AOI, 'ASCENDING', 'VH').size().getInfo() > 0)
